@@ -1,0 +1,46 @@
+# Virtual environments
+venv/
+.venv/
+
+# Node
+node_modules/
+.next/
+
+# Env files
+.env
+.env.local
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Model weights
+*.pt
+
+# Log files
+*.log
+
+# Temporary files
+*.tmp
+*.temp
+
+# OS files
+.DS_Store
+._*
+
+# Image files
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.bmp
+*.tiff
+
+# Excel files
+*.xlsx
+*.xls
+
+# Gradio cache
+.gradio/
