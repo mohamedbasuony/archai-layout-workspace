@@ -8,6 +8,13 @@ import {
   getChatModels,
   type ChatMessagePayload,
 } from "@/lib/api/chat";
+import {
+  extractWithSaiaOcrTrace,
+  fetchTraceTables,
+  mergeOCRResultText,
+  normalizeTraceStartResponse,
+  type OCRExtractResponse,
+} from "@/lib/api/ocrAgent";
 import { predictSinglePage } from "@/lib/api/predict";
 import {
   type WorkspaceChatMessage,
@@ -21,12 +28,50 @@ interface DocumentChatWorkspaceProps {
 }
 
 const STORAGE_KEY = "archai_workspace_state_v1";
-const LEGACY_EXTRACTION_MODEL_CANDIDATES = [
-  "qwen2.5-vl-72b-instruct",
-  "qwen2.5-vl",
-  "internvl2-large",
-  "internvl2",
+const LOCKED_MODEL_ID = "internvl3.5-30b-a3b";
+const TEXT_LABEL_INCLUDE_TOKENS = [
+  "script",
+  "gloss",
+  "header",
+  "catchword",
+  "page number",
+  "quire",
+  "line",
+  "text",
+  "paragraph",
 ];
+const TEXT_LABEL_EXCLUDE_TOKENS = [
+  "border",
+  "column",
+  "table",
+  "diagram",
+  "illustration",
+  "graphic",
+  "music",
+  "zone",
+];
+
+interface CocoCategory {
+  id: number;
+  name: string;
+}
+
+interface CocoAnnotation {
+  id: number;
+  category_id: number;
+  bbox: [number, number, number, number];
+}
+
+interface CocoPayload {
+  categories?: CocoCategory[];
+  annotations?: CocoAnnotation[];
+}
+
+interface OCRLocationSuggestion {
+  region_id: string;
+  category: string;
+  bbox_xywh: [number, number, number, number];
+}
 
 function makeId(prefix: string): string {
   if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
@@ -45,7 +90,33 @@ function readFileAsDataUrl(file: File): Promise<string> {
 }
 
 async function pageToFile(page: WorkspacePage): Promise<File> {
-  const response = await fetch(page.dataUrl);
+  const value = String(page.dataUrl || "");
+  if (value.startsWith("data:")) {
+    const match = value.match(/^data:([^;,]+)?(;base64)?,([\s\S]*)$/);
+    if (!match) {
+      throw new Error(`Failed to parse page bytes for ${page.name}.`);
+    }
+
+    const mime = match[1] || page.mimeType || "image/png";
+    const payload = match[3] || "";
+    const isBase64 = Boolean(match[2]);
+    let blob: Blob;
+
+    if (isBase64) {
+      const binary = atob(payload);
+      const bytes = new Uint8Array(binary.length);
+      for (let i = 0; i < binary.length; i += 1) {
+        bytes[i] = binary.charCodeAt(i);
+      }
+      blob = new Blob([bytes], { type: mime });
+    } else {
+      blob = new Blob([decodeURIComponent(payload)], { type: mime });
+    }
+
+    return new File([blob], page.name, { type: page.mimeType || blob.type || "image/png" });
+  }
+
+  const response = await fetch(value);
   if (!response.ok) {
     throw new Error(`Failed to load page bytes for ${page.name}.`);
   }
@@ -63,89 +134,84 @@ function sortedImages(files: FileList): File[] {
     .sort((a, b) => a.name.localeCompare(b.name));
 }
 
-function pickLegacyExtractionModel(
-  models: string[],
-  visionModelIds: Set<string>,
-  selectedModel: string,
-): string | null {
-  const byLower = new Map(models.map((model) => [model.toLowerCase(), model]));
-
-  for (const candidate of LEGACY_EXTRACTION_MODEL_CANDIDATES) {
-    const match = byLower.get(candidate.toLowerCase());
-    if (match) {
-      return match;
-    }
+function isRelevantTextLabel(label: string): boolean {
+  const key = label.toLowerCase();
+  if (TEXT_LABEL_EXCLUDE_TOKENS.some((token) => key.includes(token))) {
+    return false;
   }
-
-  if (selectedModel && visionModelIds.has(selectedModel)) {
-    return selectedModel;
-  }
-
-  const firstVision = models.find((model) => visionModelIds.has(model));
-  if (firstVision) {
-    return firstVision;
-  }
-
-  if (selectedModel) {
-    return selectedModel;
-  }
-
-  return LEGACY_EXTRACTION_MODEL_CANDIDATES[0];
+  return TEXT_LABEL_INCLUDE_TOKENS.some((token) => key.includes(token));
 }
 
-function normalizeExtractedText(raw: string): string {
-  const trimmed = String(raw || "").trim();
-  if (!trimmed) {
-    return "";
+function extractLocationSuggestions(coco: CocoPayload | null | undefined): OCRLocationSuggestion[] {
+  if (!coco) {
+    return [];
   }
-
-  const withoutFence = trimmed.replace(/^```[a-z]*\s*/i, "").replace(/\s*```$/, "").trim();
-  if (!withoutFence) {
-    return "";
-  }
-
-  try {
-    const parsed = JSON.parse(withoutFence) as unknown;
-    if (typeof parsed === "string") {
-      return parsed.trim();
+  const categories = Array.isArray(coco.categories) ? coco.categories : [];
+  const annotations = Array.isArray(coco.annotations) ? coco.annotations : [];
+  const categoryById = new Map<number, string>();
+  for (const category of categories) {
+    if (typeof category?.id === "number" && typeof category?.name === "string") {
+      categoryById.set(category.id, category.name);
     }
-    if (parsed && typeof parsed === "object") {
-      const maybeText = (parsed as Record<string, unknown>).text;
-      if (typeof maybeText === "string") {
-        return maybeText.trim();
-      }
-      const strings: string[] = [];
-      const collect = (value: unknown) => {
-        if (typeof value === "string") {
-          const v = value.trim();
-          if (v) {
-            strings.push(v);
-          }
-          return;
-        }
-        if (Array.isArray(value)) {
-          for (const item of value) {
-            collect(item);
-          }
-          return;
-        }
-        if (value && typeof value === "object") {
-          for (const item of Object.values(value as Record<string, unknown>)) {
-            collect(item);
-          }
-        }
-      };
-      collect(parsed);
-      return strings.join("\n").trim();
-    }
-  } catch {
-    // Keep non-JSON content as-is.
   }
 
-  return withoutFence;
+  const suggestions: OCRLocationSuggestion[] = [];
+  for (const annotation of annotations) {
+    if (!annotation || !Array.isArray(annotation.bbox) || annotation.bbox.length < 4) {
+      continue;
+    }
+    const category = categoryById.get(Number(annotation.category_id)) || "";
+    if (!category || !isRelevantTextLabel(category)) {
+      continue;
+    }
+    const [x, y, w, h] = annotation.bbox;
+    if (![x, y, w, h].every((value) => Number.isFinite(value))) {
+      continue;
+    }
+    if (w < 8 || h < 8) {
+      continue;
+    }
+    suggestions.push({
+      region_id: String(annotation.id),
+      category,
+      bbox_xywh: [x, y, w, h],
+    });
+  }
+
+  suggestions.sort((a, b) => {
+    const ay = a.bbox_xywh[1];
+    const by = b.bbox_xywh[1];
+    if (Math.abs(ay - by) > 8) {
+      return ay - by;
+    }
+    return a.bbox_xywh[0] - b.bbox_xywh[0];
+  });
+
+  return suggestions.slice(0, 60);
+}
+
+function toBase64(dataUrl: string): string {
+  const index = dataUrl.indexOf(",");
+  if (index === -1) {
+    return dataUrl;
+  }
+  return dataUrl.slice(index + 1);
+}
+
+function dedupeFlags(flags: string[]): string[] {
+  return Array.from(new Set(flags.filter(Boolean)));
+}
+
+function formatTraceTablesForChat(payload: unknown): string {
+  return JSON.stringify(payload, null, 2);
+}
+
+function getExtractionStatus(result: OCRExtractResponse): "FULL" | "PARTIAL" | "EMPTY" {
+  return result.status;
 }
 
 export function DocumentChatWorkspace({ initialDocumentId }: DocumentChatWorkspaceProps) {
+  const [clientReady, setClientReady] = useState(false);
   const [hydrated, setHydrated] = useState(false);
   const [documents, setDocuments] = useState<WorkspaceDocument[]>([]);
   const [selectedDocumentId, setSelectedDocumentId] = useState<string | null>(null);
@@ -153,9 +219,8 @@ export function DocumentChatWorkspace({ initialDocumentId }: DocumentChatWorkspa
   const [zoomByDocument, setZoomByDocument] = useState<Record<string, number>>({});
   const [messagesByDocument, setMessagesByDocument] = useState<Record<string, WorkspaceChatMessage[]>>({});
 
-  const [models, setModels] = useState<string[]>([]);
   const [visionModelIds, setVisionModelIds] = useState<Set<string>>(new Set());
-  const [selectedModel, setSelectedModel] = useState<string>("");
+  const [selectedModel, setSelectedModel] = useState<string>(LOCKED_MODEL_ID);
   const [includeCurrentPageImage, setIncludeCurrentPageImage] = useState(false);
 
   const [input, setInput] = useState("");
@@ -163,8 +228,12 @@ export function DocumentChatWorkspace({ initialDocumentId }: DocumentChatWorkspa
   const [assistantLoadingLabel, setAssistantLoadingLabel] = useState("Thinking");
   const [error, setError] = useState<string | null>(null);
   const [segmentedPreviewByPageId, setSegmentedPreviewByPageId] = useState<Record<string, string>>({});
+  const [segmentationCocoByPageId, setSegmentationCocoByPageId] = useState<Record<string, CocoPayload>>({});
   const [segmentationErrorByPageId, setSegmentationErrorByPageId] = useState<Record<string, string>>({});
   const [segmentingPageId, setSegmentingPageId] = useState<string | null>(null);
+  const [showSegmentationOverlay, setShowSegmentationOverlay] = useState(true);
+  const [ocrResult, setOcrResult] = useState<OCRExtractResponse | null>(null);
+  const [ocrModalOpen, setOcrModalOpen] = useState(false);
 
   const currentDocument = useMemo(
     () => documents.find((doc) => doc.id === selectedDocumentId) ?? null,
@@ -179,8 +248,17 @@ export function DocumentChatWorkspace({ initialDocumentId }: DocumentChatWorkspa
   const currentZoom = currentDocument ? zoomByDocument[currentDocument.id] ?? 1 : 1;
   const currentMessages = currentDocument ? (messagesByDocument[currentDocument.id] ?? []) : [];
   const currentSegmentedPreview = currentPage ? (segmentedPreviewByPageId[currentPage.id] ?? null) : null;
+  const currentSegmentationCoco = currentPage ? (segmentationCocoByPageId[currentPage.id] ?? null) : null;
   const currentSegmentationError = currentPage ? (segmentationErrorByPageId[currentPage.id] ?? null) : null;
   const currentPageIsSegmenting = Boolean(currentPage && segmentingPageId === currentPage.id);
+  const ocrStatus = ocrResult ? getExtractionStatus(ocrResult) : null;
+  const ocrText = ocrResult ? mergeOCRResultText(ocrResult) : "";
+  const ocrFlags = ocrResult ? dedupeFlags(ocrResult.warnings) : [];
+  const ocrFallbacks = ocrResult?.fallbacks ?? [];
+
+  useEffect(() => {
+    setClientReady(true);
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
@@ -189,15 +267,11 @@ export function DocumentChatWorkspace({ initialDocumentId }: DocumentChatWorkspa
         if (cancelled) {
           return;
         }
-        setModels(payload.models);
         setVisionModelIds(new Set(payload.vision_models));
-        setSelectedModel((prev) => {
-          if (prev) {
-            return prev;
-          }
-          const firstVision = payload.models.find((model) => payload.vision_models.includes(model));
-          return firstVision || payload.default_model || payload.models[0] || "";
-        });
+        setSelectedModel(LOCKED_MODEL_ID);
+        if (!payload.models.includes(LOCKED_MODEL_ID)) {
+          setError(`Locked model ${LOCKED_MODEL_ID} is not available on the backend.`);
+        }
       })
       .catch((err: unknown) => {
         if (cancelled) {
@@ -222,9 +296,7 @@ export function DocumentChatWorkspace({ initialDocumentId }: DocumentChatWorkspa
 
       const parsed = JSON.parse(raw) as WorkspacePersistedState;
       setIncludeCurrentPageImage(Boolean(parsed.includeCurrentPageImage));
-      if (parsed.selectedModel) {
-        setSelectedModel(parsed.selectedModel);
-      }
+      setSelectedModel(LOCKED_MODEL_ID);
     } catch {
       // Ignore malformed persisted state.
     } finally {
@@ -354,8 +426,8 @@ export function DocumentChatWorkspace({ initialDocumentId }: DocumentChatWorkspa
     const explicitImageAttach = Boolean(options?.forceAttachImage);
     const shouldAttachImage = explicitImageAttach || includeCurrentPageImage;
     const imageDataUrl = options?.forcedImageDataUrl ?? currentPage?.dataUrl ?? null;
-    const requestedModel = (options?.modelOverride || selectedModel || "").trim();
-    let modelForRequest = requestedModel;
+    const requestedModel = (options?.modelOverride || selectedModel || LOCKED_MODEL_ID).trim();
+    const modelForRequest = requestedModel;
     const priorMessagesForModel = [...(options?.historyForModel ?? currentMessages)];
 
     if (shouldAttachImage && !imageDataUrl) {
@@ -364,13 +436,8 @@ export function DocumentChatWorkspace({ initialDocumentId }: DocumentChatWorkspa
     }
     if (shouldAttachImage) {
       if (!modelForRequest || !visionModelIds.has(modelForRequest)) {
-        const autoVisionModel = models.find((model) => visionModelIds.has(model));
-        if (!autoVisionModel) {
-          setError("No vision-capable model is available. Pick a model with vision support.");
-          return { ok: false, error: "No vision-capable model is available." };
-        }
-        modelForRequest = autoVisionModel;
-        setSelectedModel(autoVisionModel);
+        setError(`Locked model ${LOCKED_MODEL_ID} is not vision-capable or unavailable.`);
+        return { ok: false, error: "Locked model is not vision-capable." };
       }
     }
     if (!modelForRequest) {
@@ -486,9 +553,9 @@ export function DocumentChatWorkspace({ initialDocumentId }: DocumentChatWorkspa
     await sendPromptToChat(text, { loadingLabel: "Thinking" });
   };
 
-  const handleSegmentCurrentPage = async () => {
+  const runSegmentationForCurrentPage = async (): Promise<{ previewUrl: string; coco: CocoPayload } | null> => {
     if (!currentPage) {
-      return;
+      return null;
     }
     setError(null);
     setSegmentingPageId(currentPage.id);
@@ -504,13 +571,21 @@ export function DocumentChatWorkspace({ initialDocumentId }: DocumentChatWorkspa
       const suffix = result.annotated_image_url.includes("?") ? "&" : "?";
       const url = `${result.annotated_image_url}${suffix}t=${Date.now()}`;
       setSegmentedPreviewByPageId((prev) => ({ ...prev, [currentPage.id]: url }));
+      const coco = (result.coco_json || {}) as CocoPayload;
+      setSegmentationCocoByPageId((prev) => ({ ...prev, [currentPage.id]: coco }));
+      return { previewUrl: url, coco };
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : "Segmentation failed.";
       setSegmentationErrorByPageId((prev) => ({ ...prev, [currentPage.id]: message }));
       setError(message);
+      return null;
     } finally {
       setSegmentingPageId((prev) => (prev === currentPage.id ? null : prev));
     }
+  };
+
+  const handleSegmentCurrentPage = async () => {
+    await runSegmentationForCurrentPage();
   };
 
   const handleExtractTextInChat = async () => {
@@ -518,10 +593,6 @@ export function DocumentChatWorkspace({ initialDocumentId }: DocumentChatWorkspa
       return;
     }
     const currentDocumentId = currentDocument.id;
-    if (!currentSegmentedPreview) {
-      setError("Segment the current page first, then extract text.");
-      return;
-    }
 
     const statusMessageId = makeId("msg-status");
     const assistantMessageId = makeId("msg-assistant-extract");
@@ -554,61 +625,33 @@ export function DocumentChatWorkspace({ initialDocumentId }: DocumentChatWorkspa
       });
     };
 
-    const extractionModel = pickLegacyExtractionModel(models, visionModelIds, selectedModel);
-    if (!extractionModel) {
-      setExtractionStatus("Extraction failed: no available model.");
-      setError("No extraction model is available.");
-      return;
-    }
-    setSelectedModel(extractionModel);
-    setExtractionStatus(`Extraction status: using model ${extractionModel}.`);
-
     setSending(true);
     setAssistantLoadingLabel("Extracting text");
     try {
-      setExtractionStatus("Extraction status: running OCR...");
-      const response = await createChatCompletion(
-        {
-          model: extractionModel,
-          stream: true,
-          temperature: 0,
-          context: {
-            document_id: currentDocumentId,
-            filename: currentPage.name,
-            current_page_index: currentPageIndex,
-          },
-          messages: [
-            {
-              role: "user",
-              content: [
-                {
-                  type: "text",
-                  text:
-                    "Read this manuscript page and transcribe all readable text in natural reading order. " +
-                    "Return plain text only. Do not return JSON, markdown, labels, coordinates, or explanations. " +
-                    "If no readable text is visible, return an empty string.",
-                },
-                { type: "image_url", image_url: { url: currentPage.dataUrl } },
-              ],
-            },
-          ],
-        },
-        (delta) => {
-          setMessagesByDocument((prev) => {
-            const list = [...(prev[currentDocumentId] ?? [])];
-            const index = list.findIndex((msg) => msg.id === assistantMessageId);
-            if (index === -1) {
-              return prev;
-            }
-            list[index] = { ...list[index], content: `${list[index].content}${delta}` };
-            return { ...prev, [currentDocumentId]: list };
-          });
-        },
-      );
+      setExtractionStatus("Extraction status: sending full page to SAIA OCR agent...");
 
-      const finalText = normalizeExtractedText(response.text);
+      let locationSuggestions = extractLocationSuggestions(currentSegmentationCoco);
+      if (!locationSuggestions.length) {
+        const segmentation = await runSegmentationForCurrentPage();
+        locationSuggestions = extractLocationSuggestions(segmentation?.coco ?? null);
+      }
+
+      const traceResult = await extractWithSaiaOcrTrace({
+        document_id: currentDocumentId,
+        image_id: currentDocumentId,
+        page_id: currentPage.id,
+        image_b64: toBase64(currentPage.dataUrl),
+        location_suggestions: locationSuggestions,
+        apply_proofread: true,
+      });
+      const response = normalizeTraceStartResponse(traceResult);
+      setOcrResult(response);
+      setOcrModalOpen(true);
+
+      const finalText = mergeOCRResultText(response);
       if (!finalText) {
-        setExtractionStatus("Extraction complete: no readable text detected.");
+        const status = getExtractionStatus(response);
+        setExtractionStatus(`Extraction complete (${status}): no readable text detected.`);
         setMessagesByDocument((prev) => {
           const list = [...(prev[currentDocumentId] ?? [])];
           const index = list.findIndex((msg) => msg.id === assistantMessageId);
@@ -627,7 +670,38 @@ export function DocumentChatWorkspace({ initialDocumentId }: DocumentChatWorkspa
           msg.id === assistantMessageId ? { ...msg, content: finalText } : msg,
         ),
       }));
-      setExtractionStatus("Extraction complete.");
+      const status = getExtractionStatus(response);
+      setExtractionStatus(
+        `Extraction complete (${status}) [run_id: ${traceResult.run_id}]. Fetching DB table printout...`,
+      );
+
+      try {
+        const tablePayload = await fetchTraceTables(traceResult.run_id);
+        const tableMessage: WorkspaceChatMessage = {
+          id: makeId("msg-assistant-trace-table"),
+          role: "assistant",
+          content: `Pipeline DB printout for run_id ${traceResult.run_id}:\n${formatTraceTablesForChat(tablePayload)}`,
+          createdAt: Date.now(),
+        };
+        setMessagesByDocument((prev) => ({
+          ...prev,
+          [currentDocumentId]: [...(prev[currentDocumentId] ?? []), tableMessage],
+        }));
+        setExtractionStatus(`Extraction complete (${status}) [run_id: ${traceResult.run_id}]. DB table printout posted to chat.`);
+      } catch (tableErr: unknown) {
+        const tableErrorMessage = tableErr instanceof Error ? tableErr.message : "Failed to fetch DB table printout.";
+        const tableMessage: WorkspaceChatMessage = {
+          id: makeId("msg-assistant-trace-table-error"),
+          role: "assistant",
+          content: `Run ${traceResult.run_id} completed, but DB table printout failed: ${tableErrorMessage}`,
+          createdAt: Date.now(),
+        };
+        setMessagesByDocument((prev) => ({
+          ...prev,
+          [currentDocumentId]: [...(prev[currentDocumentId] ?? []), tableMessage],
+        }));
+        setExtractionStatus(`Extraction complete (${status}) [run_id: ${traceResult.run_id}], but DB table fetch failed.`);
+      }
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : "request failed";
       setExtractionStatus(`Extraction failed: ${message}`);
@@ -637,6 +711,30 @@ export function DocumentChatWorkspace({ initialDocumentId }: DocumentChatWorkspa
       setAssistantLoadingLabel("Thinking");
     }
   };
+
+  const handleInsertOcrIntoChat = () => {
+    if (!currentDocument || !ocrText) {
+      return;
+    }
+    const message: WorkspaceChatMessage = {
+      id: makeId("msg-assistant-ocr-insert"),
+      role: "assistant",
+      content: ocrText,
+      createdAt: Date.now(),
+    };
+    setMessagesByDocument((prev) => ({
+      ...prev,
+      [currentDocument.id]: [...(prev[currentDocument.id] ?? []), message],
+    }));
+  };
+
+  if (!clientReady) {
+    return (
+      <div className="flex h-screen bg-background text-foreground" suppressHydrationWarning>
+        <div className="m-auto text-sm text-muted-foreground">Loading workspace...</div>
+      </div>
+    );
+  }
 
   return (
     <div className="flex h-screen overflow-hidden bg-background text-foreground">
@@ -713,8 +811,8 @@ export function DocumentChatWorkspace({ initialDocumentId }: DocumentChatWorkspa
 
               <div className="mb-2 flex-1 overflow-auto rounded-md border bg-background p-2">
                 <Image
-                  src={currentSegmentedPreview || currentPage.dataUrl}
-                  alt={currentSegmentedPreview ? `${currentPage.name} segmented` : currentPage.name}
+                  src={showSegmentationOverlay && currentSegmentedPreview ? currentSegmentedPreview : currentPage.dataUrl}
+                  alt={showSegmentationOverlay && currentSegmentedPreview ? `${currentPage.name} segmented` : currentPage.name}
                   width={1024}
                   height={1024}
                   unoptimized
@@ -736,10 +834,19 @@ export function DocumentChatWorkspace({ initialDocumentId }: DocumentChatWorkspa
                   type="button"
                   onClick={() => void handleExtractTextInChat()}
                   className="w-full rounded-md bg-primary px-3 py-2 text-sm font-medium text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
-                  disabled={!currentSegmentedPreview || currentPageIsSegmenting || sending}
+                  disabled={currentPageIsSegmenting || sending}
                 >
-                  Extract text in chat
+                  Extract with SAIA OCR
                 </button>
+                <label className="flex items-center gap-2 text-xs text-muted-foreground">
+                  <input
+                    type="checkbox"
+                    checked={showSegmentationOverlay}
+                    onChange={(event) => setShowSegmentationOverlay(event.target.checked)}
+                    disabled={!currentSegmentedPreview}
+                  />
+                  Show segmentation overlay
+                </label>
                 {currentSegmentedPreview && (
                   <p className="text-xs text-emerald-700">Segmented preview ready.</p>
                 )}
@@ -816,14 +923,10 @@ export function DocumentChatWorkspace({ initialDocumentId }: DocumentChatWorkspa
           <div className="ml-auto flex items-center gap-2">
             <select
               value={selectedModel}
-              onChange={(event) => setSelectedModel(event.target.value)}
+              disabled
               className="max-w-64 rounded border bg-background px-2 py-1 text-sm"
             >
-              {models.map((model) => (
-                <option key={model} value={model}>
-                  {model}
-                </option>
-              ))}
+              <option value={LOCKED_MODEL_ID}>{LOCKED_MODEL_ID}</option>
             </select>
 
             <label className="flex items-center gap-1 text-xs text-muted-foreground">
@@ -923,6 +1026,98 @@ export function DocumentChatWorkspace({ initialDocumentId }: DocumentChatWorkspa
           </div>
         </div>
       </section>
+
+      {ocrModalOpen && ocrResult && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4">
+          <div className="flex max-h-[85vh] w-full max-w-3xl flex-col overflow-hidden rounded-lg border bg-background shadow-xl">
+            <div className="flex items-center gap-3 border-b px-4 py-3">
+              <div>
+                <p className="text-sm font-semibold">SAIA OCR Result</p>
+                <p className="text-xs text-muted-foreground">
+                  Status: {ocrStatus} • Model: {ocrResult.model_used}
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setOcrModalOpen(false)}
+                className="ml-auto rounded border px-3 py-1 text-sm hover:bg-accent"
+              >
+                Close
+              </button>
+            </div>
+
+            <div className="space-y-3 overflow-y-auto px-4 py-3 text-sm">
+              <div className="rounded border p-3">
+                <p className="text-xs font-medium uppercase tracking-wide text-muted-foreground">Fallbacks</p>
+                {ocrFallbacks.length ? (
+                  <ul className="mt-2 space-y-1 text-xs">
+                    {ocrFallbacks.map((item, index) => (
+                      <li key={`${item.model}-${index}`}>
+                        {item.model}: {item.error}
+                      </li>
+                    ))}
+                  </ul>
+                ) : (
+                  <p className="mt-2 text-xs text-muted-foreground">No fallbacks used.</p>
+                )}
+              </div>
+
+              <div className="rounded border p-3">
+                <p className="text-xs font-medium uppercase tracking-wide text-muted-foreground">Warnings</p>
+                {ocrFlags.length ? (
+                  <p className="mt-2 text-xs">{ocrFlags.join(", ")}</p>
+                ) : (
+                  <p className="mt-2 text-xs text-muted-foreground">None</p>
+                )}
+              </div>
+
+              <div className="rounded border p-3">
+                <p className="text-xs font-medium uppercase tracking-wide text-muted-foreground">Extracted Text</p>
+                <p className="mt-2 text-xs text-muted-foreground">
+                  Detected language: {ocrResult.detected_language}
+                  {typeof ocrResult.language_confidence === "number"
+                    ? ` (${ocrResult.language_confidence.toFixed(2)})`
+                    : ""}
+                </p>
+                <pre className="mt-2 whitespace-pre-wrap font-sans text-sm">
+                  {ocrText || "No readable text detected on this page."}
+                </pre>
+              </div>
+            </div>
+
+            <div className="flex items-center justify-end gap-2 border-t px-4 py-3">
+              <button
+                type="button"
+                onClick={handleInsertOcrIntoChat}
+                className="rounded border px-3 py-1.5 text-sm hover:bg-accent"
+                disabled={!ocrText}
+              >
+                Insert into chat
+              </button>
+              <button
+                type="button"
+                onClick={async () => {
+                  try {
+                    await navigator.clipboard.writeText(ocrText || "");
+                  } catch {
+                    // Ignore clipboard failures.
+                  }
+                }}
+                className="rounded border px-3 py-1.5 text-sm hover:bg-accent"
+              >
+                Copy text
+              </button>
+              <button
+                type="button"
+                onClick={() => setOcrModalOpen(false)}
+                className="rounded bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90"
+              >
+                Done
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

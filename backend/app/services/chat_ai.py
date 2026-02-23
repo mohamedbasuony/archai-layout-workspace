@@ -13,10 +13,11 @@ ARCHAI_SYSTEM_PROMPT = (
     "Be precise, cite uncertainty explicitly, and provide structured JSON when the user asks for structured outputs."
 )
 LEGACY_SAIA_MODEL_FALLBACKS = [
-    "qwen2.5-vl-72b-instruct",
-    "qwen2.5-vl",
-    "internvl2-large",
-    "internvl2",
+    "qwen3-vl-30b-a3b-instruct",
+    "internvl3.5-30b-a3b",
+    "mistral-large-3-675b-instruct-2512",
+    "gemma-3-27b-it",
+    "medgemma-27b-it",
 ]
 
 
@@ -26,23 +27,32 @@ class ChatConfigError(RuntimeError):
 
 def _require_api_key() -> str:
     key = str(
-        settings.archai_chat_ai_api_key
-        or settings.archai_saia_api_key
+        settings.chat_ai_api_key
+        or os.getenv("CHAT_AI_API_KEY", "")
         or settings.saia_api_key
+        or settings.archai_chat_ai_api_key
+        or settings.archai_saia_api_key
+        or os.getenv("SAIA_API_KEY", "")
         or os.getenv("ARCHAI_CHAT_AI_API_KEY", "")
         or os.getenv("ARCHAI_SAIA_API_KEY", "")
-        or os.getenv("SAIA_API_KEY", "")
         or ""
     ).strip()
     if not key:
         raise ChatConfigError(
-            "Chat API key not configured. Set ARCHAI_CHAT_AI_API_KEY or ARCHAI_SAIA_API_KEY in backend/.env or environment."
+            "Chat API key not configured. Set CHAT_AI_API_KEY (or SAIA_API_KEY) in backend/.env or environment."
         )
     return key
 
 
 def _base_url() -> str:
-    return str(settings.archai_chat_ai_base_url or "https://chat-ai.academiccloud.de/v1").strip().rstrip("/")
+    return str(
+        settings.chat_ai_base_url
+        or os.getenv("CHAT_AI_BASE_URL", "")
+        or settings.saia_base_url
+        or settings.archai_chat_ai_base_url
+        or os.getenv("SAIA_BASE_URL", "")
+        or "https://chat-ai.academiccloud.de/v1"
+    ).strip().rstrip("/")
 
 
 def _default_model() -> str:

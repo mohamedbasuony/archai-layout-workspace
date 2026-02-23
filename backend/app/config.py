@@ -30,13 +30,30 @@ class Settings(BaseSettings):
     task_ttl_minutes: int = 60
 
     # Chat AI (GWDG OpenAI-compatible)
+    chat_ai_api_key: str = ""
+    chat_ai_base_url: str = "https://chat-ai.academiccloud.de/v1"
     archai_chat_ai_api_key: str = ""
     archai_chat_ai_base_url: str = "https://chat-ai.academiccloud.de/v1"
-    archai_chat_ai_model: str = "qwen2.5-vl-72b-instruct"
+    archai_chat_ai_model: str = "internvl3.5-30b-a3b"
+
+    # SAIA OCR Agent configuration
+    saia_api_key: str = ""
+    saia_base_url: str = "https://chat-ai.academiccloud.de/v1"
+    saia_timeout_seconds: int = 120
+    saia_models_cache_ttl_seconds: int = 300
+    saia_ocr_model_preferences: str = ""
+    saia_ocr_model_prefs: str = ""
+    saia_ocr_models: str = ""
+    saia_ocr_temperature: float = 0.0
+    saia_ocr_max_tokens: int = 4096
+    ocr_crop_upscale: int = 2
+    ocr_max_pixels_per_tile: int = 160000000
+    ocr_max_long_edge: int = 12000
+    ocr_image_size_retry_limit: int = 2
+    ocr_image_retry_shrink: float = 0.82
 
     # Backward-compatible SAIA key names (legacy config)
     archai_saia_api_key: str = ""
-    saia_api_key: str = ""
 
     @property
     def cors_origins_list(self) -> list[str]:
@@ -54,7 +71,7 @@ class Settings(BaseSettings):
     def zone_model_path(self) -> str:
         return os.path.join(self.model_dir, "best_zone_detection.pt")
 
-    model_config = {"env_file": ".env", "extra": "ignore"}
+    model_config = {"env_file": (".env", ".env.local"), "extra": "ignore"}
 
 
 settings = Settings()

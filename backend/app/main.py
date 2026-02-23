@@ -1,12 +1,14 @@
 import multiprocessing as mp
+import os
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 
 from app.config import settings
 from app.services.inference import init_model_pool, shutdown_model_pool
-from app.routers import health, classes, predict, download, analytics, chat
+from app.routers import health, classes, predict, download, analytics, chat, agents_ocr, ocr, evidence
 
 
 @asynccontextmanager
@@ -41,5 +43,12 @@ app.include_router(health.router, prefix="/api")
 app.include_router(classes.router, prefix="/api")
 app.include_router(predict.router, prefix="/api")
 app.include_router(chat.router, prefix="/api")
+app.include_router(agents_ocr.router, prefix="/api")
+app.include_router(ocr.router, prefix="/api")
+app.include_router(evidence.router, prefix="/api")
 app.include_router(download.router, prefix="/api")
 app.include_router(analytics.router, prefix="/api")
+
+static_dir = os.path.join(os.path.dirname(__file__), "static")
+if os.path.isdir(static_dir):
+    app.mount("/static", StaticFiles(directory=static_dir), name="static")
