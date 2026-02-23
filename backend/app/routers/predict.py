@@ -7,6 +7,7 @@ import json
 import os
 import tempfile
 import zipfile
+from math import sqrt
 from typing import Optional
 
 from fastapi import APIRouter, BackgroundTasks, File, Form, HTTPException, UploadFile
@@ -14,6 +15,7 @@ from fastapi.responses import StreamingResponse
 from PIL import Image
 
 from app.core.constants import FINAL_CLASSES
+from app.agents.segmentation_agent import run_single_segmentation
 from app.core.model_runner import combine_and_filter_predictions
 from app.services.coco_utils import filter_coco_by_classes, merge_coco_list, stats_from_coco
 from app.services.file_manager import TaskState, create_task, get_task, get_task_dir
@@ -25,6 +27,8 @@ router = APIRouter(tags=["predict"])
 # Valid image extensions for batch processing
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp", ".gif"}
 SKIP_PATTERNS = ["._", ".DS_Store", "Thumbs.db", "desktop.ini", "~$"]
+SEGMENTATION_MAX_PIXELS = int(os.getenv("SEGMENTATION_MAX_PIXELS", "85000000") or "85000000")
+SEGMENTATION_MAX_LONG_EDGE = int(os.getenv("SEGMENTATION_MAX_LONG_EDGE", "12000") or "12000")
 
 
 def _secure_filename(name: str) -> str:
@@ -77,6 +81,60 @@ def _safe_extract_zip(zip_path: str, extract_dir: str) -> None:
                 dst.write(src.read())
 
 
+def _prepare_image_for_segmentation(image_path: str) -> tuple[str, bool]:
+    """
+    Ensure image is valid for YOLO inference:
+    - decodable image
+    - 3-channel RGB
+    - bounded dimensions/pixel count for safer processing
+    Returns (prepared_path, changed).
+    """
+    try:
+        with Image.open(image_path) as im:
+            im.load()
+            width, height = im.size
+            if width <= 0 or height <= 0:
+                raise ValueError("Invalid image dimensions.")
+
+            working = im.convert("RGB")
+            changed = im.mode != "RGB"
+
+            max_pixels = max(1, SEGMENTATION_MAX_PIXELS)
+            max_long_edge = max(1, SEGMENTATION_MAX_LONG_EDGE)
+            scale = 1.0
+            total_pixels = width * height
+            if total_pixels > max_pixels:
+                scale = min(scale, sqrt(max_pixels / float(total_pixels)))
+            long_edge = max(width, height)
+            if long_edge > max_long_edge:
+                scale = min(scale, max_long_edge / float(long_edge))
+
+            if scale < 1.0:
+                new_w = max(1, int(round(width * scale)))
+                new_h = max(1, int(round(height * scale)))
+                working = working.resize((new_w, new_h), Image.Resampling.BICUBIC)
+                changed = True
+
+            if not changed:
+                return image_path, False
+
+            normalized_path = f"{image_path}.seg.jpg"
+            working.save(normalized_path, format="JPEG", quality=95)
+            return normalized_path, True
+    except Exception as exc:
+        raise HTTPException(status_code=422, detail=f"Uploaded file is not a valid image: {exc}") from exc
+
+
+def _is_valid_image_file(image_path: str) -> bool:
+    try:
+        with Image.open(image_path) as im:
+            im.load()
+            width, height = im.size
+            return width > 0 and height > 0
+    except Exception:
+        return False
+
+
 @router.post("/predict/single")
 async def predict_single(
     image: UploadFile = File(...),
@@ -101,32 +159,25 @@ async def predict_single(
     with open(img_path, "wb") as f:
         f.write(contents)
 
-    # Quick image validation
-    try:
-        with Image.open(img_path) as im:
-            im.verify()
-        with Image.open(img_path) as im:
-            im.load()
-            if im.size[0] <= 0 or im.size[1] <= 0:
-                raise ValueError("Invalid image dimensions.")
-    except Exception:
-        raise HTTPException(status_code=422, detail="Uploaded file is not a valid image.")
+    # Validate + normalize to RGB and safe size for model inference.
+    prepared_img_path, prepared_changed = _prepare_image_for_segmentation(img_path)
 
-    # Run models (offload CPU-bound work)
-    with tempfile.TemporaryDirectory() as tmp_dir:
-        labels_folders = await asyncio.to_thread(
-            run_models_parallel, img_path, tmp_dir, conf=confidence, iou=iou
-        )
-        coco_json = await asyncio.to_thread(combine_and_filter_predictions, img_path, labels_folders)
-
-    # Filter and annotate
-    filtered_coco = filter_coco_by_classes(coco_json, selected_classes)
     annotated_path = os.path.join(task_dir, "annotated.jpg")
-    await asyncio.to_thread(
-        draw_coco_on_image, img_path, filtered_coco, selected_classes, output_path=annotated_path
-    )
-
-    stats = stats_from_coco(filtered_coco)
+    try:
+        filtered_coco, stats = await asyncio.to_thread(
+            run_single_segmentation,
+            prepared_img_path,
+            confidence=confidence,
+            iou=iou,
+            selected_classes=selected_classes,
+            annotated_output_path=annotated_path,
+        )
+    finally:
+        if prepared_changed and prepared_img_path.endswith(".seg.jpg"):
+            try:
+                os.remove(prepared_img_path)
+            except OSError:
+                pass
 
     # Store results
     task.status = "completed"
@@ -166,16 +217,8 @@ def _process_batch(task: TaskState, zip_path: str, conf: float, iou: float, sele
                 if not os.path.isfile(full_path) or os.path.getsize(full_path) == 0:
                     continue
 
-                try:
-                    with Image.open(full_path) as test_img:
-                        test_img.verify()
-                    with Image.open(full_path) as test_img:
-                        test_img.load()
-                        if test_img.size[0] == 0 or test_img.size[1] == 0:
-                            continue
+                if _is_valid_image_file(full_path):
                     image_paths.append(full_path)
-                except Exception:
-                    continue
 
         task.total = len(image_paths)
         task.status = "processing"
@@ -186,16 +229,23 @@ def _process_batch(task: TaskState, zip_path: str, conf: float, iou: float, sele
             task.progress = idx
 
             try:
+                prepared_path, prepared_changed = _prepare_image_for_segmentation(path)
                 with tempfile.TemporaryDirectory() as tmp_dir:
-                    labels_folders = run_models_parallel(path, tmp_dir, conf=conf, iou=iou)
-                    coco_json = combine_and_filter_predictions(path, labels_folders)
+                    labels_folders = run_models_parallel(prepared_path, tmp_dir, conf=conf, iou=iou)
+                    coco_json = combine_and_filter_predictions(prepared_path, labels_folders)
 
                 filtered = filter_coco_by_classes(coco_json, selected_classes)
                 task.batch_coco_list.append(filtered)
 
                 ann_path = os.path.join(task_dir, f"annotated_{idx}.jpg")
-                draw_coco_on_image(path, filtered, selected_classes, output_path=ann_path)
+                draw_coco_on_image(prepared_path, filtered, selected_classes, output_path=ann_path)
                 task.gallery.append({"filename": fn, "annotated_path": ann_path})
+
+                if prepared_changed and prepared_path.endswith(".seg.jpg"):
+                    try:
+                        os.remove(prepared_path)
+                    except OSError:
+                        pass
 
                 stats = stats_from_coco(filtered)
                 task.stats_per_image.append({"image": fn, "stats": stats})

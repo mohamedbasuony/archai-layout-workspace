@@ -34,8 +34,20 @@ export async function apiFetch<T>(
     }
   }
   if (!res.ok) {
-    const body = await res.json().catch(() => ({ detail: res.statusText }));
-    const detail = body.detail || res.statusText;
+    let detail = res.statusText;
+    try {
+      const body = await res.json();
+      if (body && typeof body.detail === "string" && body.detail.trim()) {
+        detail = body.detail;
+      } else if (body && typeof body.message === "string" && body.message.trim()) {
+        detail = body.message;
+      }
+    } catch {
+      const text = await res.text().catch(() => "");
+      if (text.trim()) {
+        detail = text.trim();
+      }
+    }
     throw new ApiError(res.status, detail);
   }
   return res.json();

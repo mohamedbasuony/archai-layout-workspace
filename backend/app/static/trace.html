@@ -1,0 +1,280 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>ArchAI OCR Trace</title>
+    <style>
+      body { font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif; margin: 16px; }
+      h1 { margin: 0 0 12px 0; }
+      .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+      .card { border: 1px solid #ddd; border-radius: 8px; padding: 12px; }
+      label { display: block; font-size: 12px; margin-top: 8px; color: #444; }
+      input, textarea, button { width: 100%; box-sizing: border-box; padding: 8px; margin-top: 4px; }
+      textarea { min-height: 120px; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+      button { cursor: pointer; }
+      .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; white-space: pre-wrap; }
+      .row { display: flex; gap: 8px; }
+      .row > * { flex: 1; }
+      .small { font-size: 12px; color: #666; }
+      ul { margin: 8px 0 0 18px; }
+      li { margin: 4px 0; }
+      #tablesOut { max-height: 360px; overflow: auto; }
+      table { width: 100%; border-collapse: collapse; font-size: 12px; }
+      th, td { border: 1px solid #ddd; padding: 6px; text-align: left; vertical-align: top; }
+      th { background: #f6f6f6; }
+      #chunksList { max-height: 240px; overflow: auto; margin: 0; padding-left: 16px; }
+    </style>
+  </head>
+  <body>
+    <h1>ArchAI Single Page OCR Pipeline Trace</h1>
+    <p class="small">Starts OCR run, streams stage updates, and prints stored DB rows for the run.</p>
+
+    <div class="grid">
+      <section class="card">
+        <h3>Start OCR with Trace</h3>
+        <label>Document ID</label>
+        <input id="documentId" value="doc-demo" />
+        <label>Page ID</label>
+        <input id="pageId" value="page-1" />
+        <label>Image ID</label>
+        <input id="imageId" value="img-1" />
+        <label>Image Base64 (no data URL header)</label>
+        <textarea id="imageB64">iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADElEQVR42mNk+M/wHwAE/wJ/lxNn4QAAAABJRU5ErkJggg==</textarea>
+        <label><input id="applyProofread" type="checkbox" checked /> Apply proofreader</label>
+        <button id="startBtn">Start OCR Trace Run</button>
+        <p class="small" id="startMsg"></p>
+      </section>
+
+      <section class="card">
+        <h3>Connect to Run</h3>
+        <div class="row">
+          <div>
+            <label>Run ID</label>
+            <input id="runIdInput" placeholder="paste run_id" />
+          </div>
+          <div style="align-self: end;">
+            <button id="connectBtn">Connect SSE</button>
+          </div>
+        </div>
+        <p class="small" id="connMsg"></p>
+        <div id="statusBox" class="mono"></div>
+      </section>
+    </div>
+
+    <div class="grid" style="margin-top:16px;">
+      <section class="card">
+        <h3>Stage Timeline</h3>
+        <ul id="timeline"></ul>
+      </section>
+
+      <section class="card">
+        <h3>Text Preview</h3>
+        <div><strong>OCR Text</strong></div>
+        <div id="ocrText" class="mono"></div>
+        <div style="margin-top:8px;"><strong>Proofread Text</strong></div>
+        <div id="proofreadText" class="mono"></div>
+      </section>
+    </div>
+
+    <div class="grid" style="margin-top:16px;">
+      <section class="card">
+        <h3>Entities</h3>
+        <table>
+          <thead>
+            <tr>
+              <th>Type</th>
+              <th>Surface</th>
+              <th>Offsets</th>
+              <th>Confidence</th>
+              <th>Method</th>
+            </tr>
+          </thead>
+          <tbody id="entitiesBody"></tbody>
+        </table>
+      </section>
+
+      <section class="card">
+        <h3>Chunks</h3>
+        <details open>
+          <summary class="small">Line chunks (idx + offsets + preview)</summary>
+          <ul id="chunksList"></ul>
+        </details>
+      </section>
+    </div>
+
+    <section class="card" style="margin-top:16px;">
+      <h3>DB Table Printout</h3>
+      <button id="fetchTablesBtn">Fetch /api/ocr/trace/{run_id}/tables</button>
+      <div id="tablesOut" class="mono"></div>
+    </section>
+
+    <script>
+      let stream = null;
+      let currentRunId = "";
+
+      const els = {
+        documentId: document.getElementById("documentId"),
+        pageId: document.getElementById("pageId"),
+        imageId: document.getElementById("imageId"),
+        imageB64: document.getElementById("imageB64"),
+        applyProofread: document.getElementById("applyProofread"),
+        startBtn: document.getElementById("startBtn"),
+        startMsg: document.getElementById("startMsg"),
+        runIdInput: document.getElementById("runIdInput"),
+        connectBtn: document.getElementById("connectBtn"),
+        connMsg: document.getElementById("connMsg"),
+        statusBox: document.getElementById("statusBox"),
+        timeline: document.getElementById("timeline"),
+        ocrText: document.getElementById("ocrText"),
+        proofreadText: document.getElementById("proofreadText"),
+        entitiesBody: document.getElementById("entitiesBody"),
+        chunksList: document.getElementById("chunksList"),
+        fetchTablesBtn: document.getElementById("fetchTablesBtn"),
+        tablesOut: document.getElementById("tablesOut"),
+      };
+
+      function renderSnapshot(snapshot) {
+        const run = snapshot.run || {};
+        const events = snapshot.events || [];
+        const latestCompleted = snapshot.latest_completed_stage || "-";
+
+        els.statusBox.textContent = [
+          `run_id: ${snapshot.run_id || ""}`,
+          `status: ${run.status || ""}`,
+          `current_stage: ${run.current_stage || ""}`,
+          `latest_completed_stage: ${latestCompleted}`,
+          `chunks_count: ${snapshot.chunks_count ?? run.chunks_count ?? 0}`,
+          `mentions_count: ${snapshot.mentions_count ?? run.mentions_count ?? 0}`,
+          `detected_language: ${run.detected_language || ""}`,
+          `confidence: ${run.confidence ?? ""}`,
+          `updated_at: ${run.updated_at || ""}`,
+        ].join("\n");
+
+        els.timeline.innerHTML = "";
+        for (const ev of events) {
+          const li = document.createElement("li");
+          li.textContent = `${ev.ts} | ${ev.stage} | ${ev.event}${ev.message ? ` | ${ev.message}` : ""}`;
+          els.timeline.appendChild(li);
+        }
+
+        els.ocrText.textContent = run.ocr_text || "";
+        els.proofreadText.textContent = run.proofread_text || "";
+
+        const mentions = Array.isArray(snapshot.top_mentions) ? snapshot.top_mentions : [];
+        els.entitiesBody.innerHTML = "";
+        for (const mention of mentions) {
+          const tr = document.createElement("tr");
+          const tdType = document.createElement("td");
+          tdType.textContent = String(mention.ent_type || "");
+          const tdSurface = document.createElement("td");
+          tdSurface.textContent = String(mention.surface || "");
+          const tdOffsets = document.createElement("td");
+          tdOffsets.textContent = `${mention.start_offset ?? ""}..${mention.end_offset ?? ""}`;
+          const tdConfidence = document.createElement("td");
+          const conf = Number(mention.confidence);
+          tdConfidence.textContent = Number.isFinite(conf) ? conf.toFixed(2) : "";
+          const tdMethod = document.createElement("td");
+          tdMethod.textContent = String(mention.method || "");
+          tr.appendChild(tdType);
+          tr.appendChild(tdSurface);
+          tr.appendChild(tdOffsets);
+          tr.appendChild(tdConfidence);
+          tr.appendChild(tdMethod);
+          els.entitiesBody.appendChild(tr);
+        }
+
+        const chunks = Array.isArray(snapshot.chunks_preview) ? snapshot.chunks_preview : [];
+        els.chunksList.innerHTML = "";
+        for (const chunk of chunks) {
+          const li = document.createElement("li");
+          const preview = String(chunk.text || "").slice(0, 180);
+          li.textContent = `#${chunk.idx ?? "?"} [${chunk.start_offset ?? "?"}..${chunk.end_offset ?? "?"}] ${preview}`;
+          els.chunksList.appendChild(li);
+        }
+      }
+
+      function connectToRun(runId) {
+        if (!runId) {
+          return;
+        }
+        currentRunId = runId;
+        els.runIdInput.value = runId;
+
+        if (stream) {
+          stream.close();
+        }
+
+        const url = `/api/ocr/trace/stream/${encodeURIComponent(runId)}`;
+        stream = new EventSource(url);
+        els.connMsg.textContent = `Connected to ${runId}`;
+
+        stream.addEventListener("snapshot", (ev) => {
+          try {
+            const payload = JSON.parse(ev.data);
+            renderSnapshot(payload);
+            const status = String(payload?.run?.status || "").toUpperCase();
+            if (status === "COMPLETED" || status === "FAILED") {
+              stream.close();
+              els.connMsg.textContent = `Run ${runId} finished with status ${status}`;
+            }
+          } catch (err) {
+            els.connMsg.textContent = `Snapshot parse error: ${err}`;
+          }
+        });
+
+        stream.onerror = () => {
+          els.connMsg.textContent = `SSE disconnected for ${runId}`;
+        };
+      }
+
+      els.startBtn.addEventListener("click", async () => {
+        els.startMsg.textContent = "Starting...";
+        try {
+          const payload = {
+            document_id: els.documentId.value || null,
+            page_id: els.pageId.value || null,
+            image_id: els.imageId.value || null,
+            image_b64: (els.imageB64.value || "").trim(),
+            apply_proofread: Boolean(els.applyProofread.checked),
+          };
+
+          const res = await fetch("/api/ocr/page_with_trace", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(payload),
+          });
+
+          const body = await res.json();
+          if (!res.ok) {
+            throw new Error(JSON.stringify(body));
+          }
+
+          const runId = body.run_id;
+          els.startMsg.textContent = `Run started: ${runId}`;
+          connectToRun(runId);
+        } catch (err) {
+          els.startMsg.textContent = `Start failed: ${err}`;
+        }
+      });
+
+      els.connectBtn.addEventListener("click", () => {
+        connectToRun((els.runIdInput.value || "").trim());
+      });
+
+      els.fetchTablesBtn.addEventListener("click", async () => {
+        if (!currentRunId) {
+          els.tablesOut.textContent = "No active run_id. Start or connect first.";
+          return;
+        }
+        try {
+          const res = await fetch(`/api/ocr/trace/${encodeURIComponent(currentRunId)}/tables`);
+          const body = await res.json();
+          els.tablesOut.textContent = JSON.stringify(body, null, 2);
+        } catch (err) {
+          els.tablesOut.textContent = `Fetch tables failed: ${err}`;
+        }
+      });
+    </script>
+  </body>
+</html>

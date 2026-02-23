@@ -48,14 +48,14 @@ class _FakeRetryClient(_FakeClient):
 
 
 def test_list_available_models_marks_vision_models(monkeypatch: Any) -> None:
-    fake = _FakeClient(["internvl2-large", "meta-llama-3.1-8b-instruct"])
+    fake = _FakeClient(["internvl3.5-30b-a3b", "meta-llama-3.1-8b-instruct"])
     monkeypatch.setattr("app.services.chat_ai._create_client", lambda: fake)
     monkeypatch.setattr(settings, "archai_chat_ai_model", "meta-llama-3.1-8b-instruct")
 
     payload = list_available_models()
 
     assert "models" in payload
-    assert "internvl2-large" in payload["vision_models"]
+    assert "internvl3.5-30b-a3b" in payload["vision_models"]
     assert payload["default_model"] == "meta-llama-3.1-8b-instruct"
 
 
@@ -86,12 +86,12 @@ def test_create_chat_completion_injects_archai_context(monkeypatch: Any) -> None
 
 def test_create_chat_completion_retries_on_model_not_found(monkeypatch: Any) -> None:
     fake = _FakeRetryClient(
-        ["qwen2.5-vl-72b-instruct", "internvl3.5-30b-a3b"],
-        failing_model="qwen2.5-vl-72b-instruct",
+        ["internvl3.5-30b-a3b", "qwen3-vl-30b-a3b-instruct"],
+        failing_model="internvl3.5-30b-a3b",
         completion_text="retry-output",
     )
     monkeypatch.setattr("app.services.chat_ai._create_client", lambda: fake)
-    monkeypatch.setattr(settings, "archai_chat_ai_model", "qwen2.5-vl-72b-instruct")
+    monkeypatch.setattr(settings, "archai_chat_ai_model", "internvl3.5-30b-a3b")
 
     result = create_chat_completion(
         messages=[
@@ -103,10 +103,10 @@ def test_create_chat_completion_retries_on_model_not_found(monkeypatch: Any) -> 
                 ],
             }
         ],
-        model="qwen2.5-vl-72b-instruct",
+        model="internvl3.5-30b-a3b",
     )
 
     assert result["text"] == "retry-output"
     assert len(fake.calls) == 2
-    assert fake.calls[0]["model"] == "qwen2.5-vl-72b-instruct"
-    assert fake.calls[1]["model"] == "internvl3.5-30b-a3b"
+    assert fake.calls[0]["model"] == "internvl3.5-30b-a3b"
+    assert fake.calls[1]["model"] == "qwen3-vl-30b-a3b-instruct"
