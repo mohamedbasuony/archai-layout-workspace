@@ -15,12 +15,20 @@ import {
   normalizeTraceStartResponse,
   type OCRExtractResponse,
 } from "@/lib/api/ocrAgent";
+import {
+  isRagDebugEnabled,
+  getIndexStatus,
+  getRetrieveDebug,
+  getEvidencePreview,
+} from "@/lib/api/rag";
+import { getLinkingReport } from "@/lib/api/authorityLinking";
 import { predictSinglePage } from "@/lib/api/predict";
 import {
   type WorkspaceChatMessage,
   type WorkspaceDocument,
   type WorkspacePage,
   type WorkspacePersistedState,
+  type OcrMessageMeta,
 } from "@/lib/workspace/types";
 
 interface DocumentChatWorkspaceProps {
@@ -198,10 +206,6 @@ function toBase64(dataUrl: string): string {
   return dataUrl.slice(index + 1);
 }
 
-function dedupeFlags(flags: string[]): string[] {
-  return Array.from(new Set(flags.filter(Boolean)));
-}
-
 function formatTraceTablesForChat(payload: unknown): string {
   return JSON.stringify(payload, null, 2);
 }
@@ -232,8 +236,7 @@ export function DocumentChatWorkspace({ initialDocumentId }: DocumentChatWorkspa
   const [segmentationErrorByPageId, setSegmentationErrorByPageId] = useState<Record<string, string>>({});
   const [segmentingPageId, setSegmentingPageId] = useState<string | null>(null);
   const [showSegmentationOverlay, setShowSegmentationOverlay] = useState(true);
-  const [ocrResult, setOcrResult] = useState<OCRExtractResponse | null>(null);
-  const [ocrModalOpen, setOcrModalOpen] = useState(false);
+  const [expandedJsonIds, setExpandedJsonIds] = useState<Set<string>>(new Set());
 
   const currentDocument = useMemo(
     () => documents.find((doc) => doc.id === selectedDocumentId) ?? null,
@@ -251,10 +254,6 @@ export function DocumentChatWorkspace({ initialDocumentId }: DocumentChatWorkspa
   const currentSegmentationCoco = currentPage ? (segmentationCocoByPageId[currentPage.id] ?? null) : null;
   const currentSegmentationError = currentPage ? (segmentationErrorByPageId[currentPage.id] ?? null) : null;
   const currentPageIsSegmenting = Boolean(currentPage && segmentingPageId === currentPage.id);
-  const ocrStatus = ocrResult ? getExtractionStatus(ocrResult) : null;
-  const ocrText = ocrResult ? mergeOCRResultText(ocrResult) : "";
-  const ocrFlags = ocrResult ? dedupeFlags(ocrResult.warnings) : [];
-  const ocrFallbacks = ocrResult?.fallbacks ?? [];
 
   useEffect(() => {
     setClientReady(true);
@@ -595,22 +594,16 @@ export function DocumentChatWorkspace({ initialDocumentId }: DocumentChatWorkspa
     const currentDocumentId = currentDocument.id;
 
     const statusMessageId = makeId("msg-status");
-    const assistantMessageId = makeId("msg-assistant-extract");
+    const ocrMessageId = makeId("msg-ocr-result");
     const statusMessage: WorkspaceChatMessage = {
       id: statusMessageId,
       role: "assistant",
-      content: "Extraction status: preparing OCR request...",
-      createdAt: Date.now(),
-    };
-    const assistantMessage: WorkspaceChatMessage = {
-      id: assistantMessageId,
-      role: "assistant",
-      content: "",
+      content: "Extracting OCR…",
       createdAt: Date.now(),
     };
     setMessagesByDocument((prev) => ({
       ...prev,
-      [currentDocumentId]: [...(prev[currentDocumentId] ?? []), statusMessage, assistantMessage],
+      [currentDocumentId]: [...(prev[currentDocumentId] ?? []), statusMessage],
     }));
 
     const setExtractionStatus = (content: string) => {
@@ -628,7 +621,7 @@ export function DocumentChatWorkspace({ initialDocumentId }: DocumentChatWorkspa
     setSending(true);
     setAssistantLoadingLabel("Extracting text");
     try {
-      setExtractionStatus("Extraction status: sending full page to SAIA OCR agent...");
+      setExtractionStatus("Extracting OCR… running segmentation & sending to SAIA OCR agent…");
 
       let locationSuggestions = extractLocationSuggestions(currentSegmentationCoco);
       if (!locationSuggestions.length) {
@@ -645,36 +638,59 @@ export function DocumentChatWorkspace({ initialDocumentId }: DocumentChatWorkspa
         apply_proofread: true,
       });
       const response = normalizeTraceStartResponse(traceResult);
-      setOcrResult(response);
-      setOcrModalOpen(true);
 
       const finalText = mergeOCRResultText(response);
       if (!finalText) {
         const status = getExtractionStatus(response);
         setExtractionStatus(`Extraction complete (${status}): no readable text detected.`);
-        setMessagesByDocument((prev) => {
-          const list = [...(prev[currentDocumentId] ?? [])];
-          const index = list.findIndex((msg) => msg.id === assistantMessageId);
-          if (index === -1) {
-            return prev;
-          }
-          list[index] = { ...list[index], content: "No readable text detected on this page." };
-          return { ...prev, [currentDocumentId]: list };
-        });
         return;
       }
 
+      // Build OCR metadata for the inline message
+      const ocrMeta: OcrMessageMeta = {
+        detected_language: response.detected_language || "unknown",
+        confidence: response.confidence,
+        warnings: response.warnings || [],
+        script_hint: response.script_hint || "unknown",
+        lines: response.lines || [],
+        raw_json: {
+          lines: response.lines,
+          text: response.text,
+          script_hint: response.script_hint,
+          detected_language: response.detected_language,
+          confidence: response.confidence,
+          warnings: response.warnings,
+          fallbacks_used: response.fallbacks_used,
+          model_used: response.model_used,
+          status: response.status,
+          quality_label: response.quality_label,
+          sanity_metrics: response.sanity_metrics,
+        },
+        model_used: response.model_used || "trace-pipeline",
+        fallbacks_used: response.fallbacks_used || [],
+        status: response.status,
+        quality_label: response.quality_label,
+        sanity_metrics: response.sanity_metrics,
+      };
+
+      // Insert the OCR result as an inline chat message
+      const ocrMessage: WorkspaceChatMessage = {
+        id: ocrMessageId,
+        role: "assistant",
+        content: finalText,
+        createdAt: Date.now(),
+        kind: "ocr",
+        ocrMeta,
+      };
+
+      // Replace the status message with the result
+      setExtractionStatus(`Extraction complete (${response.status}) [run_id: ${traceResult.run_id}]`);
       setMessagesByDocument((prev) => ({
         ...prev,
-        [currentDocumentId]: (prev[currentDocumentId] ?? []).map((msg) =>
-          msg.id === assistantMessageId ? { ...msg, content: finalText } : msg,
-        ),
+        [currentDocumentId]: [...(prev[currentDocumentId] ?? []), ocrMessage],
       }));
-      const status = getExtractionStatus(response);
-      setExtractionStatus(
-        `Extraction complete (${status}) [run_id: ${traceResult.run_id}]. Fetching DB table printout...`,
-      );
 
+      // Fetch trace tables in background and add as a DB printout message
       try {
         const tablePayload = await fetchTraceTables(traceResult.run_id);
         const tableMessage: WorkspaceChatMessage = {
@@ -687,7 +703,6 @@ export function DocumentChatWorkspace({ initialDocumentId }: DocumentChatWorkspa
           ...prev,
           [currentDocumentId]: [...(prev[currentDocumentId] ?? []), tableMessage],
         }));
-        setExtractionStatus(`Extraction complete (${status}) [run_id: ${traceResult.run_id}]. DB table printout posted to chat.`);
       } catch (tableErr: unknown) {
         const tableErrorMessage = tableErr instanceof Error ? tableErr.message : "Failed to fetch DB table printout.";
         const tableMessage: WorkspaceChatMessage = {
@@ -700,7 +715,201 @@ export function DocumentChatWorkspace({ initialDocumentId }: DocumentChatWorkspa
           ...prev,
           [currentDocumentId]: [...(prev[currentDocumentId] ?? []), tableMessage],
         }));
-        setExtractionStatus(`Extraction complete (${status}) [run_id: ${traceResult.run_id}], but DB table fetch failed.`);
+      }
+
+      // ── RAG VALIDATION REPORT (only when ARCHAI_DEBUG_RAG is enabled) ──
+      if (isRagDebugEnabled()) {
+        const L: string[] = [];
+        const sectionPass: Record<number, boolean> = {};
+
+        // Resolve headline fields
+        let assetRef = currentDocumentId;
+        let chunksCountSqlite = 0;
+
+        L.push("=== RAG VALIDATION REPORT ===");
+
+        // ── [1] INDEX STATUS ──
+        {
+          let pass = false;
+          try {
+            const st = await getIndexStatus(traceResult.run_id);
+            chunksCountSqlite = st.chunks_total;
+            assetRef = st.asset_ref || currentDocumentId;
+            pass = st.missing_chunk_ids.length === 0 && st.chunks_indexed === st.chunks_total && st.chunks_total > 0;
+            // Print header fields now that we have them
+            L.push(`run_id: ${traceResult.run_id}`);
+            L.push(`asset_ref: ${assetRef}`);
+            L.push(`chunks_count_sqlite: ${chunksCountSqlite}`);
+            L.push("");
+            L.push(`[1] INDEX STATUS: ${pass ? "PASS" : "FAIL"}`);
+            L.push(JSON.stringify({
+              run_id: traceResult.run_id,
+              chunks_total: st.chunks_total,
+              chunks_indexed: st.chunks_indexed,
+              missing_chunk_ids: st.missing_chunk_ids,
+            }, null, 2));
+          } catch (err: unknown) {
+            const e = err as { status?: number };
+            L.push(`run_id: ${traceResult.run_id}`);
+            L.push(`asset_ref: ${assetRef}`);
+            L.push(`chunks_count_sqlite: ${chunksCountSqlite}`);
+            L.push("");
+            L.push("[1] INDEX STATUS: FAIL");
+            L.push(JSON.stringify({
+              step: "index_status",
+              status: "FAIL",
+              http_status: e.status ?? 0,
+              error: err instanceof Error ? err.message : String(err),
+            }, null, 2));
+          }
+          sectionPass[1] = pass;
+          L.push("");
+        }
+
+        // ── [2] RETRIEVE "vilain" ──
+        let retrievedChunkIds: string[] = [];
+        {
+          let pass = false;
+          try {
+            const probe = await getRetrieveDebug("vilain", 5, traceResult.run_id);
+            retrievedChunkIds = probe.results.map((r) => r.chunk_id);
+            const hasVilain = probe.results.some(
+              (r) => r.text_preview.toLowerCase().includes("vilain"),
+            );
+            pass = probe.results.length >= 1 && hasVilain;
+            L.push(`[2] RETRIEVE "vilain": ${pass ? "PASS" : "FAIL"}`);
+            L.push(JSON.stringify({
+              query: probe.query,
+              k: probe.k,
+              filter: { run_id: traceResult.run_id },
+              results: probe.results.map((r) => ({
+                chunk_id: r.chunk_id,
+                chunk_idx: r.chunk_idx,
+                offsets: r.offsets,
+                score: r.score,
+                text_preview: r.text_preview,
+              })),
+            }, null, 2));
+            if (!hasVilain && probe.results.length >= 1) {
+              L.push("→ results returned but none contain \"vilain\" (case-insensitive)");
+            }
+          } catch (err: unknown) {
+            const e = err as { status?: number };
+            L.push("[2] RETRIEVE \"vilain\": FAIL");
+            L.push(JSON.stringify({
+              step: "retrieve_debug",
+              status: "FAIL",
+              http_status: e.status ?? 0,
+              error: err instanceof Error ? err.message : String(err),
+            }, null, 2));
+          }
+          sectionPass[2] = pass;
+          L.push("");
+        }
+
+        // ── [3] EVIDENCE PREVIEW ──
+        {
+          let pass = false;
+          try {
+            const ev = await getEvidencePreview("vilain", traceResult.run_id, 5);
+            const evIds = new Set(ev.evidence_blocks.map((b) => b.chunk_id));
+            const overlap = retrievedChunkIds.some((id) => evIds.has(id));
+            pass = ev.hits >= 1 && ev.evidence_blocks.length >= 1 && overlap;
+            L.push(`[3] EVIDENCE PREVIEW: ${pass ? "PASS" : "FAIL"}`);
+            const blocksToShow = ev.evidence_blocks.slice(0, 2);
+            for (const b of blocksToShow) {
+              L.push("[EVIDENCE]");
+              L.push(`run_id: ${b.run_id}`);
+              L.push(`asset_ref: ${b.asset_ref}`);
+              L.push(`chunk_id: ${b.chunk_id}`);
+              L.push(`chunk_idx: ${b.chunk_idx}`);
+              L.push(`offsets: ${b.offsets}`);
+              L.push(`text: ${b.text}`);
+              L.push("[/EVIDENCE]");
+            }
+            L.push(`CITATION FORMAT: ${ev.citation_example}`);
+          } catch (err: unknown) {
+            const e = err as { status?: number };
+            L.push("[3] EVIDENCE PREVIEW: FAIL");
+            L.push(JSON.stringify({
+              step: "evidence_preview",
+              status: "FAIL",
+              http_status: e.status ?? 0,
+              error: err instanceof Error ? err.message : String(err),
+            }, null, 2));
+          }
+          sectionPass[3] = pass;
+          L.push("");
+        }
+
+        // ── READY ──
+        {
+          const allPass = [1, 2, 3].every((n) => sectionPass[n]);
+          L.push(`READY: ${allPass ? "PASS" : "FAIL"}`);
+          if (!allPass) {
+            const failing = [1, 2, 3].filter((n) => !sectionPass[n]).map((n) => `[${n}]`);
+            L.push(`Failing sections: ${failing.join(", ")}`);
+          }
+        }
+
+        const ragMessage: WorkspaceChatMessage = {
+          id: makeId("msg-assistant-rag-report"),
+          role: "assistant",
+          content: L.join("\n"),
+          createdAt: Date.now(),
+        };
+        setMessagesByDocument((prev) => ({
+          ...prev,
+          [currentDocumentId]: [...(prev[currentDocumentId] ?? []), ragMessage],
+        }));
+      }
+
+      // ── CONSOLIDATED REPORT (single output, replaces separate mention + linking reports) ──
+      {
+        const consolidatedReportText = (traceResult as unknown as Record<string, unknown>).consolidated_report;
+        if (typeof consolidatedReportText === "string" && consolidatedReportText.length > 0) {
+          const consolidatedMessage: WorkspaceChatMessage = {
+            id: makeId("msg-assistant-consolidated-report"),
+            role: "assistant",
+            content: consolidatedReportText,
+            createdAt: Date.now(),
+          };
+          setMessagesByDocument((prev) => ({
+            ...prev,
+            [currentDocumentId]: [...(prev[currentDocumentId] ?? []), consolidatedMessage],
+          }));
+        } else {
+          // Fallback: show mention report + linking report separately if consolidated not available
+          const mentionReportText = (traceResult as unknown as Record<string, unknown>).mention_report;
+          if (typeof mentionReportText === "string" && mentionReportText.length > 0) {
+            const mentionReportMessage: WorkspaceChatMessage = {
+              id: makeId("msg-assistant-mention-report"),
+              role: "assistant",
+              content: mentionReportText,
+              createdAt: Date.now(),
+            };
+            setMessagesByDocument((prev) => ({
+              ...prev,
+              [currentDocumentId]: [...(prev[currentDocumentId] ?? []), mentionReportMessage],
+            }));
+          }
+          try {
+            const lr = await getLinkingReport(traceResult.run_id);
+            const reportText = lr.report || "(no report available)";
+            const linkingMessage: WorkspaceChatMessage = {
+              id: makeId("msg-assistant-linking-report"),
+              role: "assistant",
+              content: reportText,
+              createdAt: Date.now(),
+            };
+            setMessagesByDocument((prev) => ({
+              ...prev,
+              [currentDocumentId]: [...(prev[currentDocumentId] ?? []), linkingMessage],
+            }));
+          } catch {
+            // silently skip linking report if unavailable
+          }
+        }
       }
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : "request failed";
@@ -710,22 +919,6 @@ export function DocumentChatWorkspace({ initialDocumentId }: DocumentChatWorkspa
       setSending(false);
       setAssistantLoadingLabel("Thinking");
     }
-  };
-
-  const handleInsertOcrIntoChat = () => {
-    if (!currentDocument || !ocrText) {
-      return;
-    }
-    const message: WorkspaceChatMessage = {
-      id: makeId("msg-assistant-ocr-insert"),
-      role: "assistant",
-      content: ocrText,
-      createdAt: Date.now(),
-    };
-    setMessagesByDocument((prev) => ({
-      ...prev,
-      [currentDocument.id]: [...(prev[currentDocument.id] ?? []), message],
-    }));
   };
 
   if (!clientReady) {
@@ -957,7 +1150,9 @@ export function DocumentChatWorkspace({ initialDocumentId }: DocumentChatWorkspa
             </p>
           ) : (
             <div className="mx-auto flex w-full max-w-3xl flex-col gap-4">
-              {currentMessages.map((message) => (
+              {currentMessages.map((message) => {
+                const isOcr = message.kind === "ocr" && message.ocrMeta;
+                return (
                 <div
                   key={message.id}
                   className={`rounded-lg px-4 py-3 text-sm leading-relaxed ${
@@ -966,8 +1161,111 @@ export function DocumentChatWorkspace({ initialDocumentId }: DocumentChatWorkspa
                       : "mr-12 border bg-card"
                   }`}
                 >
-                  <p className="mb-1 text-xs uppercase opacity-70">{message.role}</p>
-                  {message.content ? (
+                  <p className="mb-1 text-xs uppercase opacity-70">
+                    {isOcr ? "OCR result" : message.role}
+                  </p>
+                  {isOcr && message.content ? (
+                    <>
+                      {/* Proofread OCR text */}
+                      <pre className="whitespace-pre-wrap font-sans text-sm leading-relaxed select-text">
+                        {message.content}
+                      </pre>
+
+                      {/* Compact metadata */}
+                      <div className="mt-3 flex flex-wrap items-center gap-3 border-t pt-2 text-xs text-muted-foreground">
+                        {message.ocrMeta!.quality_label && (
+                          <span className={
+                            message.ocrMeta!.quality_label === "HIGH"
+                              ? "font-semibold text-green-600"
+                              : message.ocrMeta!.quality_label === "MEDIUM"
+                                ? "font-semibold text-amber-600"
+                                : "font-semibold text-red-600"
+                          }>
+                            Quality: {message.ocrMeta!.quality_label}
+                          </span>
+                        )}
+                        <span>
+                          Language: <strong>{message.ocrMeta!.detected_language}</strong>
+                        </span>
+                        {message.ocrMeta!.confidence != null && (
+                          <span>
+                            Confidence: <strong>{(message.ocrMeta!.confidence * 100).toFixed(0)}%</strong>
+                          </span>
+                        )}
+                        {message.ocrMeta!.warnings.length > 0 && (
+                          <span className="text-amber-600">
+                            Warnings: {message.ocrMeta!.warnings.slice(0, 3).join(", ")}
+                            {message.ocrMeta!.warnings.length > 3 && ` (+${message.ocrMeta!.warnings.length - 3})`}
+                          </span>
+                        )}
+                      </div>
+
+                      {/* Action buttons */}
+                      <div className="mt-2 flex items-center gap-2">
+                        <button
+                          type="button"
+                          onClick={async () => {
+                            try {
+                              await navigator.clipboard.writeText(message.content);
+                            } catch {
+                              // Ignore clipboard failures.
+                            }
+                          }}
+                          className="rounded border px-2 py-1 text-xs hover:bg-accent"
+                        >
+                          Copy
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setExpandedJsonIds((prev) => {
+                              const next = new Set(prev);
+                              if (next.has(message.id)) {
+                                next.delete(message.id);
+                              } else {
+                                next.add(message.id);
+                              }
+                              return next;
+                            });
+                          }}
+                          className="rounded border px-2 py-1 text-xs hover:bg-accent"
+                        >
+                          {expandedJsonIds.has(message.id) ? "Hide details" : "Show details"}
+                        </button>
+                      </div>
+
+                      {/* Collapsible details section */}
+                      {expandedJsonIds.has(message.id) && (
+                        <div className="mt-2 space-y-2 rounded border bg-muted/40 p-2 text-xs">
+                          {message.ocrMeta!.sanity_metrics && (
+                            <div>
+                              <p className="mb-1 font-semibold">Sanity metrics</p>
+                              <table className="w-full text-left">
+                                <tbody>
+                                  {Object.entries(message.ocrMeta!.sanity_metrics).map(([key, val]) => (
+                                    <tr key={key} className="border-b last:border-0">
+                                      <td className="py-0.5 pr-3 text-muted-foreground">{key.replace(/_/g, " ")}</td>
+                                      <td className="py-0.5 font-mono">
+                                        {typeof val === "number" ? (val * 100).toFixed(1) + "%" : String(val)}
+                                      </td>
+                                    </tr>
+                                  ))}
+                                </tbody>
+                              </table>
+                            </div>
+                          )}
+                          {message.ocrMeta!.raw_json && (
+                            <details>
+                              <summary className="cursor-pointer font-semibold">Raw JSON</summary>
+                              <pre className="mt-1 max-h-48 overflow-auto">
+                                {JSON.stringify(message.ocrMeta!.raw_json, null, 2)}
+                              </pre>
+                            </details>
+                          )}
+                        </div>
+                      )}
+                    </>
+                  ) : message.content ? (
                     <p className="whitespace-pre-wrap">{message.content}</p>
                   ) : sending && message.role === "assistant" ? (
                     <div className="flex items-center gap-2 text-muted-foreground">
@@ -986,7 +1284,8 @@ export function DocumentChatWorkspace({ initialDocumentId }: DocumentChatWorkspa
                     </div>
                   ) : null}
                 </div>
-              ))}
+                );
+              })}
             </div>
           )}
         </div>
@@ -1026,98 +1325,6 @@ export function DocumentChatWorkspace({ initialDocumentId }: DocumentChatWorkspa
           </div>
         </div>
       </section>
-
-      {ocrModalOpen && ocrResult && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4">
-          <div className="flex max-h-[85vh] w-full max-w-3xl flex-col overflow-hidden rounded-lg border bg-background shadow-xl">
-            <div className="flex items-center gap-3 border-b px-4 py-3">
-              <div>
-                <p className="text-sm font-semibold">SAIA OCR Result</p>
-                <p className="text-xs text-muted-foreground">
-                  Status: {ocrStatus} • Model: {ocrResult.model_used}
-                </p>
-              </div>
-              <button
-                type="button"
-                onClick={() => setOcrModalOpen(false)}
-                className="ml-auto rounded border px-3 py-1 text-sm hover:bg-accent"
-              >
-                Close
-              </button>
-            </div>
-
-            <div className="space-y-3 overflow-y-auto px-4 py-3 text-sm">
-              <div className="rounded border p-3">
-                <p className="text-xs font-medium uppercase tracking-wide text-muted-foreground">Fallbacks</p>
-                {ocrFallbacks.length ? (
-                  <ul className="mt-2 space-y-1 text-xs">
-                    {ocrFallbacks.map((item, index) => (
-                      <li key={`${item.model}-${index}`}>
-                        {item.model}: {item.error}
-                      </li>
-                    ))}
-                  </ul>
-                ) : (
-                  <p className="mt-2 text-xs text-muted-foreground">No fallbacks used.</p>
-                )}
-              </div>
-
-              <div className="rounded border p-3">
-                <p className="text-xs font-medium uppercase tracking-wide text-muted-foreground">Warnings</p>
-                {ocrFlags.length ? (
-                  <p className="mt-2 text-xs">{ocrFlags.join(", ")}</p>
-                ) : (
-                  <p className="mt-2 text-xs text-muted-foreground">None</p>
-                )}
-              </div>
-
-              <div className="rounded border p-3">
-                <p className="text-xs font-medium uppercase tracking-wide text-muted-foreground">Extracted Text</p>
-                <p className="mt-2 text-xs text-muted-foreground">
-                  Detected language: {ocrResult.detected_language}
-                  {typeof ocrResult.language_confidence === "number"
-                    ? ` (${ocrResult.language_confidence.toFixed(2)})`
-                    : ""}
-                </p>
-                <pre className="mt-2 whitespace-pre-wrap font-sans text-sm">
-                  {ocrText || "No readable text detected on this page."}
-                </pre>
-              </div>
-            </div>
-
-            <div className="flex items-center justify-end gap-2 border-t px-4 py-3">
-              <button
-                type="button"
-                onClick={handleInsertOcrIntoChat}
-                className="rounded border px-3 py-1.5 text-sm hover:bg-accent"
-                disabled={!ocrText}
-              >
-                Insert into chat
-              </button>
-              <button
-                type="button"
-                onClick={async () => {
-                  try {
-                    await navigator.clipboard.writeText(ocrText || "");
-                  } catch {
-                    // Ignore clipboard failures.
-                  }
-                }}
-                className="rounded border px-3 py-1.5 text-sm hover:bg-accent"
-              >
-                Copy text
-              </button>
-              <button
-                type="button"
-                onClick={() => setOcrModalOpen(false)}
-                className="rounded bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90"
-              >
-                Done
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
     </div>
   );
 }

@@ -203,6 +203,150 @@ def _context_to_system_message(context: dict[str, Any] | None) -> str:
     return "\n".join(lines)
 
 
+# ── RAG evidence injection ──────────────────────────────────────────────
+
+_RAG_INSTRUCTION = (
+    "\n\nYou have been given supporting EVIDENCE blocks retrieved from "
+    "indexed OCR transcripts.  When quoting or paraphrasing manuscript "
+    "text you MUST cite like: "
+    "(asset_ref=..., run_id=..., chunk_id=..., offsets=start-end).  "
+    "Do not invent quotes outside the evidence.  If none of the "
+    "evidence is relevant, say so explicitly and answer from general "
+    "knowledge."
+)
+
+
+def _retrieve_evidence(
+    messages: Sequence[dict[str, Any]],
+    context: dict[str, Any] | None,
+) -> str:
+    """Run RAG retrieval and return formatted evidence blocks (or ``""``).
+
+    Looks at the latest user message as the query.  Optionally scopes
+    to a specific ``run_id`` if one is supplied in *context*.
+    """
+    try:
+        from app.services.rag_store import retrieve_chunks, format_evidence_blocks
+    except Exception:  # noqa: BLE001
+        return ""
+
+    # Extract the latest user message text as the query
+    query = ""
+    for msg in reversed(messages):
+        if str(msg.get("role") or "").lower() == "user":
+            content = msg.get("content")
+            if isinstance(content, str):
+                query = content.strip()
+            elif isinstance(content, list):
+                parts = [
+                    str(b.get("text", "")) for b in content
+                    if isinstance(b, dict) and str(b.get("type", "")).lower() == "text"
+                ]
+                query = " ".join(parts).strip()
+            break
+
+    if not query:
+        return ""
+
+    run_ids: list[str] | None = None
+    if context:
+        rid = context.get("run_id") or context.get("document_id")
+        if rid:
+            run_ids = [str(rid)]
+
+    try:
+        hits = retrieve_chunks(query, run_ids=run_ids)
+    except Exception:  # noqa: BLE001
+        return ""
+
+    if not hits:
+        return ""
+
+    evidence_text = format_evidence_blocks(hits)
+
+    # Debug logging
+    try:
+        from app.services.rag_debug import log_chat_evidence
+        evidence_ids = [
+            {
+                "chunk_id": h.get("chunk_id", ""),
+                "chunk_idx": h.get("chunk_idx", 0),
+                "offsets": f"{h.get('start_offset', 0)}-{h.get('end_offset', 0)}",
+            }
+            for h in hits
+        ]
+        log_chat_evidence(
+            run_id=run_ids[0] if run_ids else None,
+            asset_ref=hits[0].get("asset_ref") if hits else None,
+            k=len(hits),
+            evidence_ids=evidence_ids,
+            query=query,
+            full_evidence_text=evidence_text,
+        )
+    except Exception:  # noqa: BLE001
+        pass
+
+    return evidence_text
+
+
+def build_rag_evidence_for_debug(
+    query: str,
+    run_id: str,
+    k: int = 8,
+) -> dict[str, Any]:
+    """Return a debug payload showing how RAG evidence would look in-chat.
+
+    Used by the frontend RAG Validation Report to preview the exact
+    ``[EVIDENCE]…[/EVIDENCE]`` blocks and citation format the LLM sees.
+    """
+    from app.services.rag_store import retrieve_chunks, format_evidence_blocks
+
+    hits = retrieve_chunks(query, top_k=k, run_ids=[run_id])
+    evidence_text = format_evidence_blocks(hits) if hits else ""
+
+    evidence_ids = [
+        {
+            "chunk_id": h.get("chunk_id", ""),
+            "chunk_idx": h.get("chunk_idx", 0),
+            "offsets": f"{h.get('start_offset', 0)}-{h.get('end_offset', 0)}",
+        }
+        for h in hits
+    ]
+
+    citation_example = ""
+    if hits:
+        h = hits[0]
+        citation_example = (
+            f"(asset_ref={h.get('asset_ref', '')}, "
+            f"run_id={h.get('run_id', '')}, "
+            f"chunk_id={h.get('chunk_id', '')}, "
+            f"offsets={h.get('start_offset', 0)}-{h.get('end_offset', 0)})"
+        )
+
+    # Build individual evidence blocks for structured preview
+    evidence_blocks: list[dict[str, Any]] = []
+    for h in hits:
+        evidence_blocks.append({
+            "run_id": h.get("run_id", ""),
+            "asset_ref": h.get("asset_ref", ""),
+            "chunk_id": h.get("chunk_id", ""),
+            "chunk_idx": h.get("chunk_idx", 0),
+            "offsets": f"{h.get('start_offset', 0)}-{h.get('end_offset', 0)}",
+            "text": h.get("text", ""),
+        })
+
+    return {
+        "query": query,
+        "k": k,
+        "hits": len(hits),
+        "evidence_ids": evidence_ids,
+        "evidence_blocks": evidence_blocks,
+        "citation_example": citation_example,
+        "evidence_text": evidence_text,
+        "rag_instruction": _RAG_INSTRUCTION.strip(),
+    }
+
+
 def _normalize_message(message: dict[str, Any]) -> dict[str, Any]:
     role = str(message.get("role") or "user").strip().lower()
     if role not in {"system", "user", "assistant"}:
@@ -222,6 +366,12 @@ def _prepare_messages(messages: Sequence[dict[str, Any]], context: dict[str, Any
 
     prepared = [_normalize_message(msg) for msg in messages]
     system_prompt = _context_to_system_message(context)
+
+    # ── RAG evidence injection ──────────────────────────────────────
+    evidence = _retrieve_evidence(prepared, context)
+    if evidence:
+        system_prompt += _RAG_INSTRUCTION + "\n\n" + evidence
+
     return [{"role": "system", "content": system_prompt}, *prepared]
 
 

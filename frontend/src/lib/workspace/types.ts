@@ -1,4 +1,19 @@
 export type ChatRole = "user" | "assistant" | "system";
+export type ChatMessageKind = "text" | "ocr";
+
+export interface OcrMessageMeta {
+  detected_language: string;
+  confidence: number | null;
+  warnings: string[];
+  script_hint: string;
+  lines: string[];
+  raw_json: Record<string, unknown> | null;
+  model_used: string;
+  fallbacks_used: string[];
+  status: string;
+  quality_label?: string;
+  sanity_metrics?: Record<string, number>;
+}
 
 export interface WorkspacePage {
   id: string;
@@ -19,6 +34,8 @@ export interface WorkspaceChatMessage {
   role: ChatRole;
   content: string;
   createdAt: number;
+  kind?: ChatMessageKind;
+  ocrMeta?: OcrMessageMeta;
 }
 
 export interface WorkspacePersistedState {

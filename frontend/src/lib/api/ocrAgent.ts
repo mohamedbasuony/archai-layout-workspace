@@ -33,6 +33,8 @@ export interface OCRExtractResponse {
   lines: string[];
   text: string;
   fallbacks?: OCRFallback[];
+  quality_label?: string;
+  sanity_metrics?: Record<string, number>;
 }
 
 export interface OCRTraceStartResponse {
@@ -44,10 +46,14 @@ export interface OCRTraceStartResponse {
     detected_language: string;
     confidence: number;
     warnings: string[];
+    quality_label?: string;
+    sanity_metrics?: Record<string, number>;
   };
   proofread_text: string;
   detected_language: string;
   final_confidence: number | null;
+  quality_label?: string;
+  sanity_metrics?: Record<string, number>;
 }
 
 export interface OCRTraceTable {
@@ -159,6 +165,8 @@ export function normalizeTraceStartResponse(payload: OCRTraceStartResponse): OCR
     lines,
     text,
     fallbacks: [],
+    quality_label: payload.quality_label || payload.ocr_result.quality_label,
+    sanity_metrics: payload.sanity_metrics || payload.ocr_result.sanity_metrics,
   };
 }
 

@@ -23,6 +23,7 @@ PALEO_PROOFREAD_SYSTEM_PROMPT = (
     "NEVER invent text.\n"
     "NEVER replace […] with guessed content.\n"
     "NEVER remove ? or […] unless the existing OCR characters already make the reading deterministic.\n"
+    "If OCR appears to guess a word that is not supported by the visible letters, prefer replacing uncertain characters with ? or […] rather than inventing.\n"
     "Preserve line breaks and reading order (one manuscript line per line).\n"
     "Preserve abbreviations; do NOT expand abbreviations.\n"
     "Do NOT translate. Do NOT modernize. If unsure, leave unchanged.\n"
@@ -68,7 +69,40 @@ LATIN_SAFE_CORRECTIONS = {
 
 TOKEN_RE = re.compile(r"[A-Za-z][A-Za-z'’\\-]*")
 SINGLE_INITIAL_RE = re.compile(r"^[A-Z]$")
+# Regex: line starts with a single consonant (NOT a vowel) followed by space + word.
+# This catches OCR artifacts like "n ous" → "nous", "p our" → "pour", etc.
+# Vowels (a, e, i, o, u, y) are excluded because standalone vowels are often real words.
+_LEADING_CONSONANT_FRAG_RE = re.compile(
+    r"^([bcdfghjklmnpqrstvwxzBCDFGHJKLMNPQRSTVWXZ])\s+([a-zA-ZÀ-ÿ])"
+)
 
+# Regex: line starts with a single digit that is suspicious (not clearly a list number)
+_LEADING_STRAY_DIGIT_RE = re.compile(r"^(\d)\s+([a-zA-ZÀ-ÿ])")
+
+
+def apply_fragment_merge(text: str) -> str:
+    """Merge leading single-consonant fragments and strip stray leading digits.
+    
+    Examples:
+        "n ous" → "nous"
+        "p our" → "pour"
+        "9 ous" → "ous"   (stray digit removed)
+    
+    Vowels (a/e/i/o/u/y/A/E/I/O/U/Y) are NOT merged because they are often
+    legitimate standalone words or articles.
+    """
+    if not text:
+        return ""
+    lines = text.splitlines()
+    merged: list[str] = []
+    for line in lines:
+        stripped = line.rstrip()
+        # Merge consonant fragments: "n ous" → "nous"
+        stripped = _LEADING_CONSONANT_FRAG_RE.sub(r"\1\2", stripped)
+        # Strip stray leading digit: "9 ous" → "ous"
+        stripped = _LEADING_STRAY_DIGIT_RE.sub(r"\2", stripped)
+        merged.append(stripped)
+    return "\n".join(merged)
 
 def _clean_plain_text(value: str) -> str:
     text = (value or "").strip()
@@ -181,7 +215,8 @@ def apply_latin_micro_corrections(text: str, script_hint: str | None) -> str:
 def apply_archai_safe_normalizer(text: str, script_hint: str | None) -> str:
     if not text:
         return ""
-    normalized = apply_decorated_initial_fix(text, script_hint)
+    normalized = apply_fragment_merge(text)
+    normalized = apply_decorated_initial_fix(normalized, script_hint)
     normalized = apply_latin_micro_corrections(normalized, script_hint)
     return normalized
 
@@ -209,6 +244,10 @@ class OcrProofreaderAgent:
 
         source = apply_archai_safe_normalizer(source, script_hint)
 
+        # Compute pre-proofread sanity baseline
+        from app.agents.saia_ocr_agent import compute_sanity
+        pre_sanity = compute_sanity(source)
+
         response = self.client.chat_completion(
             model=self._select_model(),
             temperature=0.0,
@@ -230,4 +269,28 @@ class OcrProofreaderAgent:
         cleaned = _clean_plain_text(str(response.get("text") or ""))
         if not cleaned:
             return source
-        return apply_archai_safe_normalizer(cleaned, script_hint)
+        cleaned = apply_archai_safe_normalizer(cleaned, script_hint)
+
+        # Post-proofread sanity guard: reject if proofreader over-corrected
+        post_sanity = compute_sanity(cleaned)
+        unc_dropped = (
+            post_sanity["uncertainty_marker_ratio"] < pre_sanity["uncertainty_marker_ratio"] - 0.02
+        )
+        quality_worsened = (
+            post_sanity["weird_ratio"] > pre_sanity["weird_ratio"] + 0.02
+            or post_sanity["digit_ratio"] > pre_sanity["digit_ratio"] + 0.01
+            or post_sanity["single_char_ratio"] > pre_sanity["single_char_ratio"] + 0.03
+            or post_sanity.get("junk_ratio", 0) > pre_sanity.get("junk_ratio", 0) + 0.02
+        )
+        if unc_dropped and quality_worsened:
+            # Proofreader removed uncertainty markers but introduced junk -> reject
+            return source
+
+        # Also reject if proofreader completely removed all uncertainty when input had some
+        if (
+            pre_sanity["uncertainty_marker_ratio"] > 0.01
+            and post_sanity["uncertainty_marker_ratio"] == 0.0
+        ):
+            return source
+
+        return cleaned
