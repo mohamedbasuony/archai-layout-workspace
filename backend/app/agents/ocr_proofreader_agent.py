@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+from dataclasses import dataclass
 
 from app.config import settings
 from app.services.saia_client import SaiaClient
@@ -184,6 +185,142 @@ def apply_archai_safe_normalizer(text: str, script_hint: str | None) -> str:
     normalized = apply_decorated_initial_fix(text, script_hint)
     normalized = apply_latin_micro_corrections(normalized, script_hint)
     return normalized
+
+
+# ── Proofreader guard ─────────────────────────────────────────────────
+# Rejects proofreader output that looks like hallucination rather than
+# genuine correction.  The guard is conservative: when in doubt, keep
+# the raw OCR.
+
+# Thresholds
+_MAX_CHAR_EDIT_RATIO = 0.40       # reject if >40% of chars changed
+_MAX_LINE_COUNT_DRIFT = 0.30      # reject if line-count changed >30%
+_MIN_UNCERTAINTY_RETENTION = 0.50  # reject if >50% of [?/…] markers vanished
+_MAX_TOKEN_CHURN = 0.50           # reject if >50% of tokens are new
+
+
+@dataclass(frozen=True)
+class ProofreadVerdict:
+    """Result of the proofreader guard check."""
+    accepted: bool
+    reason: str
+    char_edit_ratio: float = 0.0
+    line_drift: float = 0.0
+    uncertainty_retention: float = 1.0
+    token_churn: float = 0.0
+
+
+def _normalised_levenshtein(a: str, b: str) -> float:
+    """Character-level edit distance normalised to 0-1 (1 = completely different)."""
+    if a == b:
+        return 0.0
+    la, lb = len(a), len(b)
+    if la == 0 or lb == 0:
+        return 1.0
+    prev = list(range(lb + 1))
+    for i in range(1, la + 1):
+        curr = [i] + [0] * lb
+        for j in range(1, lb + 1):
+            cost = 0 if a[i - 1] == b[j - 1] else 1
+            curr[j] = min(curr[j - 1] + 1, prev[j] + 1, prev[j - 1] + cost)
+        prev = curr
+    return prev[lb] / max(la, lb)
+
+
+def _count_uncertainty_markers(text: str) -> int:
+    """Count uncertainty markers: ?, …, [?], […]."""
+    return text.count("?") + text.count("…") + text.count("[…]") * 2 + text.count("[?]") * 2
+
+
+def _token_set(text: str) -> set[str]:
+    return {t.lower() for t in re.split(r"\s+", text.strip()) if t}
+
+
+def check_proofread_delta(raw_ocr: str, proofread: str) -> ProofreadVerdict:
+    """Check whether proofreader output is a safe correction or a hallucination.
+
+    Returns a ProofreadVerdict indicating whether to accept the proofread text.
+    """
+    raw_norm = re.sub(r"\s+", " ", raw_ocr.strip().lower())
+    proof_norm = re.sub(r"\s+", " ", proofread.strip().lower())
+
+    # 1. Character-level edit ratio
+    char_edit = _normalised_levenshtein(raw_norm, proof_norm)
+
+    # 2. Line-count drift
+    raw_lines = [ln for ln in raw_ocr.splitlines() if ln.strip()]
+    proof_lines = [ln for ln in proofread.splitlines() if ln.strip()]
+    if raw_lines:
+        line_drift = abs(len(proof_lines) - len(raw_lines)) / max(len(raw_lines), 1)
+    else:
+        line_drift = 0.0
+
+    # 3. Uncertainty marker retention
+    raw_markers = _count_uncertainty_markers(raw_ocr)
+    if raw_markers > 0:
+        proof_markers = _count_uncertainty_markers(proofread)
+        unc_retention = proof_markers / raw_markers
+    else:
+        unc_retention = 1.0
+
+    # 4. Token churn: fraction of proofread tokens that weren't in raw
+    raw_tokens = _token_set(raw_ocr)
+    proof_tokens = _token_set(proofread)
+    if proof_tokens:
+        new_tokens = proof_tokens - raw_tokens
+        token_churn = len(new_tokens) / len(proof_tokens)
+    else:
+        token_churn = 0.0
+
+    # --- Decision ---
+    if char_edit > _MAX_CHAR_EDIT_RATIO:
+        return ProofreadVerdict(
+            accepted=False,
+            reason=f"PROOFREAD_REJECTED:char_edit_ratio={char_edit:.2f}>{_MAX_CHAR_EDIT_RATIO}",
+            char_edit_ratio=char_edit,
+            line_drift=line_drift,
+            uncertainty_retention=unc_retention,
+            token_churn=token_churn,
+        )
+
+    if line_drift > _MAX_LINE_COUNT_DRIFT:
+        return ProofreadVerdict(
+            accepted=False,
+            reason=f"PROOFREAD_REJECTED:line_drift={line_drift:.2f}>{_MAX_LINE_COUNT_DRIFT}",
+            char_edit_ratio=char_edit,
+            line_drift=line_drift,
+            uncertainty_retention=unc_retention,
+            token_churn=token_churn,
+        )
+
+    if unc_retention < _MIN_UNCERTAINTY_RETENTION:
+        return ProofreadVerdict(
+            accepted=False,
+            reason=f"PROOFREAD_REJECTED:uncertainty_stripped={unc_retention:.2f}<{_MIN_UNCERTAINTY_RETENTION}",
+            char_edit_ratio=char_edit,
+            line_drift=line_drift,
+            uncertainty_retention=unc_retention,
+            token_churn=token_churn,
+        )
+
+    if token_churn > _MAX_TOKEN_CHURN:
+        return ProofreadVerdict(
+            accepted=False,
+            reason=f"PROOFREAD_REJECTED:token_churn={token_churn:.2f}>{_MAX_TOKEN_CHURN}",
+            char_edit_ratio=char_edit,
+            line_drift=line_drift,
+            uncertainty_retention=unc_retention,
+            token_churn=token_churn,
+        )
+
+    return ProofreadVerdict(
+        accepted=True,
+        reason="PROOFREAD_ACCEPTED",
+        char_edit_ratio=char_edit,
+        line_drift=line_drift,
+        uncertainty_retention=unc_retention,
+        token_churn=token_churn,
+    )
 
 
 class OcrProofreaderAgent:

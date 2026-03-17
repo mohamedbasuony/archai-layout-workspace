@@ -406,6 +406,7 @@ def enforce_quality_gates(
     quality_report: OCRQualityReport,
     *,
     run_id: str = "",
+    lexical_plausibility: float | None = None,
 ) -> dict[str, Any]:
     """Enforce all hard quality gates and return gate decisions.
 
@@ -471,6 +472,17 @@ def enforce_quality_gates(
         "value": quality_report.uncertainty_density,
         "threshold": UNCERTAINTY_HARD_LIMIT,
     }
+
+    # Gate: lexical plausibility (optional — only when language detection ran)
+    _LEXICAL_HARD_LIMIT = 0.20
+    if lexical_plausibility is not None:
+        gates["LEXICAL_PLAUSIBILITY"] = {
+            "passed": lexical_plausibility >= _LEXICAL_HARD_LIMIT,
+            "value": lexical_plausibility,
+            "threshold": _LEXICAL_HARD_LIMIT,
+        }
+        if not gates["LEXICAL_PLAUSIBILITY"]["passed"]:
+            blocked.extend(["token_search", "token_ner"])
 
     downstream = decide_downstream_mode(quality_report.quality_label)
 

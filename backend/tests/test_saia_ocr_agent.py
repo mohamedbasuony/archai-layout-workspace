@@ -73,7 +73,7 @@ def _png_b64(width: int, height: int) -> str:
 
 
 def test_prompt_declares_json_schema_and_strict_rules() -> None:
-    assert "Keys must be exactly: lines, text, script_hint, detected_language, confidence, warnings." in SAIA_OCR_USER_PROMPT
+    assert "keys must be exactly: lines, text, script_hint, detected_language, confidence, warnings." in SAIA_OCR_USER_PROMPT
     assert "If nothing readable is visible, return lines=[] and text=\"\"." in SAIA_OCR_USER_PROMPT
 
 

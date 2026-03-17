@@ -1,6 +1,6 @@
 "use client";
 
-import { ChangeEvent, useEffect, useMemo, useState } from "react";
+import { ChangeEvent, useEffect, useMemo, useRef, useState } from "react";
 import Image from "next/image";
 
 import {
@@ -348,7 +348,7 @@ function normalizeLabelText(text: string): string {
     .replace(/\bregions\b/g, "region");
 }
 
-type WorkspaceIntent = "segment" | "extract" | "translate" | "entities" | "crop" | null;
+type WorkspaceIntent = "segment" | "extract" | "translate" | "entities" | "crop" | "label_analysis" | null;
 
 function isSegmentationIntent(text: string): boolean {
   const value = normalizeCommandText(text);
@@ -397,6 +397,11 @@ function isCropIntent(text: string): boolean {
   return value.includes("crop") || value.includes("cut out") || value.includes("isolate");
 }
 
+function isLabelAnalysisPrompt(text: string): boolean {
+  const value = normalizeLabelText(text);
+  return /(what is this|what is that|explain|style|art style|origin|origins|motif|ornament|ornamental|decorative|decoration|shape|symbol|design|embellished|initial)/.test(value);
+}
+
 function isEntityIntent(text: string): boolean {
   const value = normalizeCommandText(text);
   const hasEntityTopic = /(entity|entities|person|persons|people|place|places|location|locations|name|names|mention|mentioned|mentions|who|where)/.test(value);
@@ -426,10 +431,13 @@ function detectWorkspaceIntent(text: string): WorkspaceIntent {
 function buildEnglishTranslationPrompt(sourceText: string): string {
   return [
     "Translate the following OCR-extracted manuscript text into English.",
-    "Return plain English prose only.",
+    "This is a best-effort translation task.",
+    "Never refuse, block, or gate the translation.",
+    "Never answer with policy text such as 'the OCR is too uncertain' or similar.",
+    "Return plain English only.",
     "Do not return JSON.",
     "Do not explain what you are doing.",
-    "Preserve uncertainty when spans are unreadable or marked with ? or […].",
+    "If parts are uncertain, translate what you can and preserve uncertainty inline with markers like [unclear] or [?].",
     "",
     "Source text:",
     sourceText,
@@ -461,6 +469,8 @@ function buildContextualUserPrompt(
     blocks.push(
       "",
       "Task: translate the OCR text into English.",
+      "This is always a best-effort translation request.",
+      "Never refuse, gate, or say the OCR is too uncertain.",
       "Return only the English translation.",
       "If a span is uncertain, preserve that uncertainty in English instead of copying the source wording verbatim.",
     );
@@ -648,6 +658,8 @@ export function DocumentChatWorkspace({ initialDocumentId }: DocumentChatWorkspa
   const [authorityReportByPageId, setAuthorityReportByPageId] = useState<Record<string, string>>({});
   const [segmentingPageId, setSegmentingPageId] = useState<string | null>(null);
   const [showSegmentationOverlay, setShowSegmentationOverlay] = useState(true);
+  const chatScrollContainerRef = useRef<HTMLDivElement | null>(null);
+  const chatScrollAnchorRef = useRef<HTMLDivElement | null>(null);
 
   const currentDocument = useMemo(
     () => documents.find((doc) => doc.id === selectedDocumentId) ?? null,
@@ -668,6 +680,17 @@ export function DocumentChatWorkspace({ initialDocumentId }: DocumentChatWorkspa
   const currentOcrRunId = currentPage ? (ocrRunIdByPageId[currentPage.id] ?? "") : "";
   const currentAuthorityReport = currentPage ? (authorityReportByPageId[currentPage.id] ?? "") : "";
   const currentPageIsSegmenting = Boolean(currentPage && segmentingPageId === currentPage.id);
+
+  useEffect(() => {
+    const container = chatScrollContainerRef.current;
+    const anchor = chatScrollAnchorRef.current;
+    if (!container || !anchor) {
+      return;
+    }
+    requestAnimationFrame(() => {
+      anchor.scrollIntoView({ block: "end", behavior: "auto" });
+    });
+  }, [currentMessages, sending, currentDocument?.id]);
 
   useEffect(() => {
     setClientReady(true);
@@ -992,6 +1015,13 @@ export function DocumentChatWorkspace({ initialDocumentId }: DocumentChatWorkspa
     };
 
     const intent = detectWorkspaceIntent(text);
+    const matchedLabel = resolveCropLabelFromPrompt(text, currentSegmentationCoco);
+
+    if (!intent && matchedLabel && isLabelAnalysisPrompt(text)) {
+      appendMessages(documentId, [userMessage]);
+      await handleLabelAnalysisInChat(text);
+      return;
+    }
 
     if (intent === "segment") {
       appendMessages(documentId, [userMessage]);
@@ -1054,6 +1084,98 @@ export function DocumentChatWorkspace({ initialDocumentId }: DocumentChatWorkspa
       return null;
     } finally {
       setSegmentingPageId((prev) => (prev === currentPage.id ? null : prev));
+    }
+  };
+
+  const handleLabelAnalysisInChat = async (userText: string) => {
+    if (!currentPage || !currentDocument) {
+      return;
+    }
+
+    const currentDocumentId = currentDocument.id;
+    const statusMessageId = makeId("msg-status-label-analysis");
+    appendMessages(currentDocumentId, [
+      {
+        id: statusMessageId,
+        role: "assistant",
+        content: "Label analysis status: preparing cropped label image...",
+        createdAt: Date.now(),
+      },
+    ]);
+
+    const setLabelStatus = (content: string) => {
+      setMessagesByDocument((prev) => {
+        const list = [...(prev[currentDocumentId] ?? [])];
+        const index = list.findIndex((msg) => msg.id === statusMessageId);
+        if (index === -1) {
+          return prev;
+        }
+        list[index] = { ...list[index], content };
+        return { ...prev, [currentDocumentId]: list };
+      });
+    };
+
+    setError(null);
+
+    try {
+      let coco = currentSegmentationCoco;
+      if (!coco) {
+        setLabelStatus("Label analysis status: running segmentation first...");
+        const segmentation = await runSegmentationForCurrentPage();
+        coco = segmentation?.coco ?? null;
+      }
+
+      if (!coco) {
+        setLabelStatus("Label analysis failed: segmentation data is unavailable.");
+        return;
+      }
+
+      const label = resolveCropLabelFromPrompt(userText, coco);
+      if (!label) {
+        const labels = availableCropLabels(coco);
+        appendMessages(currentDocumentId, [
+          {
+            id: makeId("msg-assistant-label-analysis-no-match"),
+            role: "assistant",
+            content: labels.length
+              ? `Label analysis failed: no label matched your request. Available labels: ${labels.join(", ")}`
+              : "Label analysis failed: no labels are available on this page.",
+            createdAt: Date.now(),
+          },
+        ]);
+        setLabelStatus("Label analysis failed: no matching label found.");
+        return;
+      }
+
+      setLabelStatus(`Label analysis status: cropping "${label}" and sending it to the model...`);
+      const cropped = await buildTransparentCropOverlay(currentPage.dataUrl, coco, label);
+      const prompt = [
+        "Answer the user's question about the attached cropped manuscript label image.",
+        "The attached image contains only the requested label in its original page position.",
+        "Label name:",
+        label,
+        "",
+        "User request:",
+        userText,
+        "",
+        "Focus on visible form, ornament, likely art style, decorative function, and plausible historical/manuscript context.",
+        "Do not mention internal pipeline steps.",
+      ].join("\n");
+
+      await sendPromptToChat(prompt, {
+        displayText: userText,
+        attachImage: true,
+        forcedImageDataUrl: cropped.imageUrl,
+        loadingLabel: "Analyzing label",
+        historyForModel: [],
+      });
+      setLabelStatus(`Label analysis complete for "${label}".`);
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : "Label analysis request failed.";
+      setError(message);
+      setLabelStatus(`Label analysis failed: ${message}`);
+    } finally {
+      setAssistantLoadingLabel("Thinking");
     }
   };
 
@@ -1628,7 +1750,7 @@ export function DocumentChatWorkspace({ initialDocumentId }: DocumentChatWorkspa
           </div>
         </div>
 
-        <div className="min-h-0 flex-1 overflow-y-auto px-4 py-4">
+        <div ref={chatScrollContainerRef} className="min-h-0 flex-1 overflow-y-auto px-4 py-4">
           {!currentMessages.length ? (
             <p className="mx-auto mt-8 max-w-xl text-center text-sm text-muted-foreground">
               Ask questions about this page, or type `segment this page` / `extract text` to run the pipeline directly in chat.
@@ -1677,6 +1799,7 @@ export function DocumentChatWorkspace({ initialDocumentId }: DocumentChatWorkspa
                   ) : null}
                 </div>
               ))}
+              <div ref={chatScrollAnchorRef} />
             </div>
           )}
         </div>

@@ -10,8 +10,10 @@ from typing import Any, Sequence
 import numpy as np
 from PIL import Image, ImageFilter
 
-from app.agents.ocr_proofreader_agent import OcrProofreaderAgent
+from app.agents.ocr_proofreader_agent import OcrProofreaderAgent, check_proofread_delta
 from app.config import settings
+from app.services.lexicon_trust import lexical_trust_adjustment
+from app.services.multiview import generate_variants, pick_retry_variant
 from app.schemas.agents_ocr import (
     DEFAULT_SAIA_OCR_MODEL_PREFS,
     SaiaOCRFallback,
@@ -89,71 +91,102 @@ ANGLO_NORMAN_MARKERS = {"anglo", "norman", "normand", "engleterre"}
 SAIA_OCR_PROMPT_VERSION = "saia_ocr_full_page_v1"
 SAIA_OCR_SYSTEM_PROMPT = (
     "You are a professional paleographer producing diplomatic OCR for historical manuscripts.\n"
-    "Transcribe ONLY what is visibly written in the provided full page image in natural reading order.\n"
+    "Transcribe ONLY what is visibly written in the provided image in natural reading order.\n"
     "NEVER invent, continue, normalize, or complete missing text from memory or external context.\n"
     "Use uncertainty markers exactly: ? for unclear characters and […] for unclear spans.\n"
     "Do not guess words.\n"
     "If a word is not clearly legible, you MUST NOT output a plausible substitute.\n"
     "For partially legible words: keep visible letters and replace unclear characters with ? (example: tresr?uerend).\n"
     "For wholly unclear words/spans: output […], not a made-up token.\n"
-    "Never replace unclear text with a different familiar word (for example, do not turn an unclear title into fiancee).\n"
+    "Never replace unclear text with a different familiar word.\n"
     "Treat decorated initials as letters when they clearly form the first letter(s) of a line/word.\n"
     "\n"
+    "CRITICAL: GOTHIC BOOKHAND / TEXTURA READING GUIDE\n"
+    "Medieval manuscripts are typically written in Gothic textura or bookhand. You MUST apply these rules:\n"
+    "\n"
+    "MINIM CONFUSION — the most common OCR error:\n"
+    "  Gothic script writes i, u, n, m as sequences of identical vertical strokes (minims).\n"
+    "  - Two minims = u or n (context decides).\n"
+    "  - Three minims = m, in, ni, ui, iu.\n"
+    "  - Do NOT guess: if a minim sequence is ambiguous, transcribe the most likely reading based on surrounding letters.\n"
+    "  - Common minim-heavy words in Old French/Latin: uilain (vilain), honeur (honneur), enuie, dominus, anima.\n"
+    "\n"
+    "LONG-S (ſ) vs f:\n"
+    "  - Long-s (ſ) looks almost identical to f but has NO crossbar or only a half-crossbar on the left.\n"
+    "  - f has a FULL crossbar through the stem.\n"
+    "  - Common misread: 'furent' read as 'surent', or 'si' read as 'fi'. Check the crossbar carefully.\n"
+    "  - In diplomatic transcription, you may output either 's' or 'ſ' for long-s.\n"
+    "\n"
+    "TIRONIAN ET (⁊ / z-shaped):\n"
+    "  - In many medieval manuscripts, 'et' (and) is written as a z-shaped or ⁊-shaped symbol.\n"
+    "  - Transcribe it as 'z' or '⁊' or 'et' — but be consistent. The symbol is NOT the letter z.\n"
+    "  - If you see a standalone z-like character between words, it almost certainly means 'et'.\n"
+    "\n"
+    "ABBREVIATION MARKS:\n"
+    "  - A horizontal bar (macron/tilde) over a vowel usually indicates a missing nasal: ā = an/am, ō = on/om, ū = un/um.\n"
+    "  - A bar over a consonant often indicates a missing following letter: q̄ = que, p̄ = per/par/pre.\n"
+    "  - Superscript letters indicate omitted sequences.\n"
+    "  - DO NOT expand abbreviations — keep the abbreviated form as written.\n"
+    "  - If an abbreviation mark is visible, note it; do not silently drop it.\n"
+    "\n"
+    "LETTER CONFUSIONS TO WATCH:\n"
+    "  - c/t: in Gothic, c and t look very similar. Context helps: 'ct' clusters are common in Latin.\n"
+    "  - r: Gothic r has two forms — normal r and round-r (shaped like 2) used after o, p, b, d.\n"
+    "  - d: Gothic d can be upright (like modern d) or uncial (rounded back, looks like ð without the stroke).\n"
+    "  - v/b: Gothic v and b can be confused. v is usually used word-initially for 'u' sounds.\n"
+    "  - a/o: in some hands these are very similar.\n"
+    "\n"
+    "DECORATED / RUBRICATED INITIALS:\n"
+    "  - Large coloured letters (red, blue, gold) at line starts are decorated initials.\n"
+    "  - They are real letters — transcribe them as the letter they represent.\n"
+    "  - A large R, C, L, Q, etc. at the start of a stanza is the first letter of the first word.\n"
+    "\n"
+    "LAYOUT:\n"
+    "  - Many manuscript pages have TWO COLUMNS. Read each column top-to-bottom, left column first.\n"
+    "  - Marginal annotations may appear outside the main text block.\n"
+    "  - Verse texts have one line of poetry per manuscript line.\n"
+    "\n"
     "NUMERAL AND SPACING RULES\n"
-    "- Do NOT output Arabic numerals (0-9) unless they are clearly written as numerals in the manuscript.\n"
-    "- Historical manuscripts rarely contain Arabic digits; if you see a stroke that *might* be a digit but could also be a letter or abbreviation mark, prefer the letter or ? — never guess a digit.\n"
-    "- Do NOT insert spaces inside a single word. A word is a continuous run of letters in the manuscript; keep it as one token.\n"
-    "- If two letters appear close but you are unsure whether they belong to the same word, keep them together rather than splitting.\n"
+    "- Do NOT output Arabic numerals (0-9) unless clearly written as numerals in the manuscript.\n"
+    "- Do NOT insert spaces inside a single word.\n"
+    "- If two letters appear close but you are unsure whether they belong to the same word, keep them together.\n"
     "\n"
     "Language selection rubric (detected_language)\n"
-    "- detected_language must reflect the transcription language of the visible text, not modern normalization.\n"
-    "- If non-Latin script is visible, choose the matching enum: greek, hebrew, arabic, or church_slavonic (for Cyrillic).\n"
-    "- If Latin script:\n"
-    "  - Choose latin when morphology is clearly Latin (for example many -us/-um/-ae endings; forms like domini, anno, gratia, episcopus).\n"
-    "  - If text is clearly French-family (Oïl), choose among old_french, middle_french, french conservatively:\n"
-    "    - Choose middle_french for general historical French spellings typical of c. 1400-1600, or whenever uncertain among French variants.\n"
-    "    - Choose old_french only when earlier Old French morphology/spelling is strongly explicit.\n"
-    "    - Choose french only when spelling is clearly modern French.\n"
-    "  - anglo_norman MUST ONLY be used with explicit Anglo-Norman evidence (insular/Norman-specific orthography or unmistakable Anglo-Norman lexical items).\n"
-    "    If unsure, do NOT use anglo_norman; use middle_french.\n"
-    "- Strong Middle French anchors for language classification only (do not insert unless visible): tres, tresreuerend, pere, euesque/evesque, prince, lausanne, approchant, an de grace, considerat, desirs, chapellain, seruiteur, inuentions, poethiques.\n"
+    "- detected_language must reflect the language of the visible text.\n"
+    "- Choose latin for clearly Latin morphology (many -us/-um/-ae endings).\n"
+    "- For French-family text, prefer old_french for pre-1300 texts, middle_french for c.1300-1500, french for modern.\n"
+    "- anglo_norman only with explicit Anglo-Norman evidence; if unsure, use old_french or middle_french.\n"
     "- Confidence guidance:\n"
-    "  - confidence is a float 0..1.\n"
     "  - Long readable text with strong language cues: 0.80-0.95.\n"
-    "  - Noisy or short text with plausible cues: 0.55-0.75.\n"
-    "  - Truly ambiguous or mixed-language text: choose mixed and keep confidence <= 0.60.\n"
+    "  - Noisy or short text: 0.55-0.75.\n"
+    "  - Truly ambiguous or mixed: choose mixed and keep confidence <= 0.60.\n"
     "\n"
     "Return exactly one JSON object with keys: lines, text, script_hint, detected_language, confidence, warnings.\n"
     "text MUST equal \"\\n\".join(lines).\n"
     "detected_language MUST be one of: latin, old_english, middle_english, french, old_french, middle_french, anglo_norman, occitan, old_high_german, middle_high_german, german, dutch, italian, spanish, portuguese, catalan, church_slavonic, greek, hebrew, arabic, mixed, unknown.\n"
-    "If you feel tempted to output a known passage (e.g., scripture / standard Latin boilerplate) that is not clearly visible, STOP and output lines=[] and text=\"\" instead.\n"
+    "If you feel tempted to output a known passage that is not clearly visible, STOP and output lines=[] and text=\"\" instead.\n"
     "If you are not sure a word is correct, you MUST output ? or […]; do not output a plausible-looking word without visible support."
 )
 SAIA_OCR_USER_PROMPT = (
     "Return JSON only.\n"
-    "Schema rules:\n"
-    "- Keys must be exactly: lines, text, script_hint, detected_language, confidence, warnings.\n"
-    "- One manuscript line per entry in lines.\n"
-    "- Each entry of lines MUST be a single manuscript line and MUST NOT contain '\\n'.\n"
+    "Schema: keys must be exactly: lines, text, script_hint, detected_language, confidence, warnings.\n"
+    "- One manuscript line per entry in lines. Each entry MUST NOT contain '\\n'.\n"
     "- text must equal \"\\n\".join(lines).\n"
     "- Preserve original spelling, abbreviations, punctuation, capitalization, and line breaks.\n"
     "- Do not translate, normalize, modernize, or expand abbreviations.\n"
-    "- Use uncertainty markers exactly: ? and […].\n"
-    "- If you are unsure of a word, use ? or […] instead of guessing.\n"
-    "- Do NOT output Arabic numerals (0-9) unless clearly written as numerals in the manuscript.\n"
-    "- Do NOT insert spaces inside a single word.\n"
+    "- Use uncertainty markers: ? for unclear characters, […] for unclear spans.\n"
     "- No markdown, no explanations, no extra keys.\n"
     "\n"
-    "Language choice rules for detected_language:\n"
-    "- Allowed values only: latin, old_english, middle_english, french, old_french, middle_french, anglo_norman, occitan, old_high_german, middle_high_german, german, dutch, italian, spanish, portuguese, catalan, church_slavonic, greek, hebrew, arabic, mixed, unknown.\n"
-    "- For non-Latin script, choose the matching enum.\n"
-    "- For Latin script: choose latin for clearly Latin morphology.\n"
-    "- For French-family historical text, prefer middle_french when uncertain between french/old_french/middle_french.\n"
-    "- Use anglo_norman only with explicit Anglo-Norman evidence; if unsure, use middle_french.\n"
-    "- Middle French anchors (classification only, never insertion): tres, tresreuerend, pere, euesque/evesque, prince, lausanne, approchant, an de grace, considerat, desirs, chapellain, seruiteur, inuentions, poethiques.\n"
+    "READING REMINDERS FOR GOTHIC SCRIPT:\n"
+    "- This manuscript is likely in Gothic textura/bookhand. Read each letter carefully.\n"
+    "- Watch for MINIM confusion: sequences of identical vertical strokes encode i, u, n, m.\n"
+    "- The z-shaped symbol between words = Tironian et (meaning 'and'). Transcribe as z or et.\n"
+    "- Long-s (ſ) has NO crossbar; f HAS a crossbar. Do not confuse them.\n"
+    "- Bars/tildes over letters = abbreviation marks (nasal or missing letters). Keep them.\n"
+    "- Two-column layouts: read left column completely first, then right column.\n"
+    "- Decorated/colored initials are real letters — include them in the transcription.\n"
     "\n"
-    "If location suggestions are provided, treat them as hints only for where text is likely located on the full page.\n"
-    "Do not output coordinates in the response.\n"
+    "Language: use old_french for pre-1300 French, middle_french for c.1300-1500.\n"
     "If nothing readable is visible, return lines=[] and text=\"\"."
 )
 SAIA_OCR_JSON_REPAIR_PROMPT = (
@@ -239,14 +272,14 @@ def _encode_png_base64(image: Image.Image) -> str:
 # sees colour cues (rubricated initials, ink colour, marginalia).
 # ---------------------------------------------------------------------------
 
-_ENHANCE_CLAHE_CLIP = 3.0       # clip limit for CLAHE (higher = more contrast)
+_ENHANCE_CLAHE_CLIP = 2.0       # clip limit for CLAHE (moderate — don't blow out minims)
 _ENHANCE_CLAHE_GRID = 8         # tile grid for adaptive histogram
-_ENHANCE_BILATERAL_D = 7        # bilateral filter diameter
-_ENHANCE_BILATERAL_SC = 50.0    # sigma-colour  (preserve edges)
-_ENHANCE_BILATERAL_SS = 50.0    # sigma-space   (spatial smoothing)
-_ENHANCE_SHARPEN_RADIUS = 2     # unsharp-mask radius in px
-_ENHANCE_SHARPEN_PERCENT = 120  # unsharp-mask strength (%)
-_ENHANCE_SHARPEN_THRESH = 3     # unsharp-mask threshold
+_ENHANCE_BILATERAL_D = 5        # bilateral filter diameter (lighter touch)
+_ENHANCE_BILATERAL_SC = 40.0    # sigma-colour  (preserve edges, lighter)
+_ENHANCE_BILATERAL_SS = 40.0    # sigma-space   (spatial smoothing, lighter)
+_ENHANCE_SHARPEN_RADIUS = 1     # unsharp-mask radius in px (gentle — don't warp minims)
+_ENHANCE_SHARPEN_PERCENT = 80   # unsharp-mask strength (%) (reduced from 120)
+_ENHANCE_SHARPEN_THRESH = 4     # unsharp-mask threshold (raised to avoid sharpening noise)
 _ENHANCE_ENABLED = True         # master switch (can be overridden via env)
 
 
@@ -723,7 +756,11 @@ SAIA_TILE_SYSTEM_ADDENDUM = (
     "Do NOT repeat text that is not present in the crop. "
     "Preserve line breaks as they appear in the crop. "
     "Do NOT output Arabic numerals (0-9) unless clearly written as numerals. "
-    "Do NOT insert spaces inside a single word."
+    "Do NOT insert spaces inside a single word.\n"
+    "REMEMBER: Gothic minims (vertical strokes) encode i/u/n/m — read them carefully. "
+    "The z-shaped mark between words = 'et' (Tironian nota). "
+    "Long-s has no crossbar; f has a crossbar. "
+    "Bars over letters = abbreviation marks — keep them."
 )
 
 
@@ -952,12 +989,33 @@ def _pad_rect(
     img_h: int,
     pad_ratio: float = _TILE_PAD_RATIO,
 ) -> tuple[int, int, int, int]:
-    """Add padding around a rectangle, clamped to image bounds."""
+    """Add *dynamic* padding around a rectangle, clamped to image bounds.
+
+    Padding adapts to region size:
+      - Small regions (<300px short side) get extra padding to avoid
+        clipping ascenders, descenders, and decorated initials.
+      - The vertical pad is always >= horizontal pad because manuscript
+        text lines have ascenders/descenders that extend above/below.
+    """
     x1, y1, x2, y2 = rect
     rw = x2 - x1
     rh = y2 - y1
-    px = max(4, int(round(rw * pad_ratio)))
-    py = max(4, int(round(rh * pad_ratio)))
+    short_side = min(rw, rh)
+
+    # Base pad from ratio
+    base_px = max(4, int(round(rw * pad_ratio)))
+    base_py = max(4, int(round(rh * pad_ratio)))
+
+    # Dynamic boost for small regions (ascender/descender protection)
+    if short_side < 300:
+        boost = max(8, int(round(short_side * 0.12)))
+        base_px += boost
+        base_py += boost
+
+    # Vertical pad should be >= horizontal pad (text has vertical extenders)
+    py = max(base_py, base_px)
+    px = base_px
+
     return (
         max(0, x1 - px),
         max(0, y1 - py),
@@ -970,35 +1028,70 @@ def _order_tiles_reading(
     rects: list[tuple[int, int, int, int]],
     img_w: int,
 ) -> list[tuple[int, int, int, int]]:
-    """Sort tiles in reading order: detect column layout, left→right cols, top→bottom within each col."""
+    """Sort tiles in reading order with adaptive column detection.
+
+    Instead of a fixed 45% x-threshold, uses gap-based clustering:
+      1. Sort x-centers, find the largest horizontal gap.
+      2. If the gap is > 8% of page width AND both sides have tiles,
+         treat as two columns.
+      3. For each column group: sort top→bottom.
+      4. Marginal regions (very narrow, at page edges) are appended last
+         to avoid polluting the main text flow.
+    """
     if len(rects) <= 1:
         return list(rects)
 
-    # Compute x-centers
-    x_centers = [((r[0] + r[2]) / 2.0) for r in rects]
-    mid_x = float(img_w) * _TILE_COLUMN_SPLIT_X_RATIO
+    # --- Separate marginal regions from main text ---
+    main_rects: list[tuple[int, int, int, int]] = []
+    marginal_rects: list[tuple[int, int, int, int]] = []
+    for r in rects:
+        rw = r[2] - r[0]
+        # Marginal: very narrow (<12% of page width) AND at page edges
+        is_marginal = (
+            rw < float(img_w) * 0.12
+            and (r[0] < float(img_w) * 0.08 or r[2] > float(img_w) * 0.92)
+        )
+        if is_marginal:
+            marginal_rects.append(r)
+        else:
+            main_rects.append(r)
 
-    # Heuristic: split into left/right column if enough tiles on both sides
-    left_tiles = [(r, xc) for r, xc in zip(rects, x_centers) if xc < mid_x]
-    right_tiles = [(r, xc) for r, xc in zip(rects, x_centers) if xc >= mid_x]
+    if not main_rects:
+        # All marginal → just sort top-to-bottom
+        return sorted(rects, key=lambda r: (r[1], r[0]))
 
-    # Only treat as two columns if both sides have tiles and leftmost/rightmost centers
-    # are sufficiently separated
-    is_two_col = False
-    if left_tiles and right_tiles:
-        left_max_x = max(xc for _, xc in left_tiles)
-        right_min_x = min(xc for _, xc in right_tiles)
-        # Columns exist if there's a meaningful gap
-        if right_min_x - left_max_x > float(img_w) * 0.08:
-            is_two_col = True
+    # --- Adaptive column detection via gap analysis ---
+    x_centers = sorted([(r[0] + r[2]) / 2.0 for r in main_rects])
+
+    # Find largest gap between consecutive x-centers
+    best_gap = 0.0
+    best_gap_pos = 0.0
+    for i in range(len(x_centers) - 1):
+        gap = x_centers[i + 1] - x_centers[i]
+        if gap > best_gap:
+            best_gap = gap
+            best_gap_pos = (x_centers[i] + x_centers[i + 1]) / 2.0
+
+    # Two columns if gap > 8% of page width
+    is_two_col = best_gap > float(img_w) * 0.08
 
     if is_two_col:
-        left_sorted = sorted(left_tiles, key=lambda t: t[0][1])  # sort by y1
-        right_sorted = sorted(right_tiles, key=lambda t: t[0][1])
-        return [r for r, _ in left_sorted] + [r for r, _ in right_sorted]
+        left = [(r, (r[0] + r[2]) / 2.0) for r in main_rects if (r[0] + r[2]) / 2.0 < best_gap_pos]
+        right = [(r, (r[0] + r[2]) / 2.0) for r in main_rects if (r[0] + r[2]) / 2.0 >= best_gap_pos]
+        if left and right:
+            left_sorted = sorted(left, key=lambda t: t[0][1])
+            right_sorted = sorted(right, key=lambda t: t[0][1])
+            ordered = [r for r, _ in left_sorted] + [r for r, _ in right_sorted]
+        else:
+            ordered = sorted(main_rects, key=lambda r: (r[1], r[0]))
     else:
-        # Single column: sort top→bottom, break ties by x
-        return sorted(rects, key=lambda r: (r[1], r[0]))
+        ordered = sorted(main_rects, key=lambda r: (r[1], r[0]))
+
+    # Marginal regions last, sorted top→bottom
+    if marginal_rects:
+        ordered.extend(sorted(marginal_rects, key=lambda r: (r[1], r[0])))
+
+    return ordered
 
 
 def _crop_and_maybe_upscale(
@@ -1961,6 +2054,12 @@ class SaiaOCRAgent:
             return lines, text, ["PROOFREAD_EMPTY_RESULT"]
         if corrected_text.strip() == text.strip():
             return corrected_lines, corrected_text, ["proofread:no_changes"]
+
+        # ── Proofreader guard: reject hallucinated rewrites ──
+        verdict = check_proofread_delta(text, corrected_text)
+        if not verdict.accepted:
+            return lines, text, [verdict.reason]
+
         return corrected_lines, corrected_text, []
 
     def _request_tile_json_from_model(
@@ -2177,6 +2276,56 @@ class SaiaOCRAgent:
                 "weird_ratio": 1.0,
                 "uncertainty_marker_ratio": 0.0,
             }
+
+            # --- Multi-view retry: if initial result is weak, try alt variant ---
+            _mv_weak = (
+                tile_text
+                and tile_conf < 0.65
+                and (
+                    tile_sanity.get("weird_ratio", 0.0) >= 0.08
+                    or tile_sanity.get("single_char_ratio", 0.0) >= 0.12
+                )
+            )
+            if _mv_weak:
+                try:
+                    variants = generate_variants(crop)
+                    alt = pick_retry_variant(variants, "enhanced_rgb")
+                    if alt is not None:
+                        alt_b64 = _encode_png_base64(alt.image)
+                        alt_parsed = self._request_tile_json_from_model(
+                            model=model,
+                            tile_image_b64=alt_b64,
+                            tile_index=idx,
+                            total_tiles=len(rects),
+                        )
+                        alt_text = str(alt_parsed.get("text") or "").strip()
+                        alt_conf = max(0.0, min(1.0, float(alt_parsed.get("confidence", 0.0) or 0.0)))
+                        alt_sanity = compute_sanity(alt_text) if alt_text else {"weird_ratio": 1.0}
+                        # Pick the variant with lower weird_ratio + higher conf
+                        alt_score = alt_conf * (1.0 - alt_sanity.get("weird_ratio", 0.0))
+                        orig_score = tile_conf * (1.0 - tile_sanity.get("weird_ratio", 0.0))
+                        if alt_score > orig_score and alt_text:
+                            _tile_logger.info(
+                                "Tile %d: multiview %s beat enhanced_rgb (%.3f > %.3f)",
+                                idx, alt.label, alt_score, orig_score,
+                            )
+                            parsed = alt_parsed
+                            tile_lines = [str(ln) for ln in parsed.get("lines", []) if str(ln).strip()]
+                            tile_text = alt_text
+                            tile_script = str(parsed.get("script_hint") or "unknown").lower()
+                            tile_lang = _normalize_detected_language(str(parsed.get("detected_language") or "unknown"))
+                            tile_conf = alt_conf
+                            tile_warnings = [str(w) for w in parsed.get("warnings", []) if str(w).strip()]
+                            tile_sanity = alt_sanity
+                            all_warnings.append(f"tile_{idx}: MULTIVIEW_RETRY:{alt.label}")
+                except Exception as exc:
+                    _tile_logger.debug("Tile %d multiview retry failed: %s", idx, exc)
+
+            # --- Lexical trust adjustment ---
+            if tile_text and tile_lang != "unknown":
+                tile_conf, lex_warns = lexical_trust_adjustment(tile_conf, tile_text, tile_lang)
+                tile_warnings.extend(lex_warns)
+
             # --- Non-Latin tile contamination check ---
             has_non_latin_warning = any(
                 "non-latin" in str(w).lower() or "non_latin" in str(w).lower()
@@ -2485,6 +2634,11 @@ class SaiaOCRAgent:
             low_quality = _is_low_text_quality(text, lines, script_hint)
             if low_quality:
                 warnings.append("LOW_TEXT_QUALITY")
+
+            # --- Lexical trust adjustment on full-page result ---
+            if text and detected_language != "unknown":
+                confidence, lex_warns = lexical_trust_adjustment(confidence, text, detected_language)
+                warnings.extend(lex_warns)
 
             if (hallucinated or low_quality) and index + 1 < len(candidate_models):
                 fallbacks.append(SaiaOCRFallback(model=model, error="LOW_TEXT_QUALITY"))

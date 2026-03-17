@@ -56,6 +56,7 @@ from app.schemas.agents_ocr import (
 )
 from app.config import settings as _app_settings
 from app.services.saia_client import SaiaConfigError
+from app.services.lexicon_trust import lexical_plausibility as _lexical_plausibility
 from app.services.ocr_quality import (
     compute_quality_report,
     check_mention_recall,
@@ -2590,7 +2591,12 @@ async def ocr_page_with_trace(payload: SaiaFullPageExtractRequest) -> dict[str, 
                       f"entropy={ocr_quality_report.char_entropy:.4f}")
 
             # ── Enforce quality gates ─────────────────────────────────
-            gate_decisions = enforce_quality_gates(ocr_quality_report, run_id=run_id)
+            _lex_lang = ocr_payload.get("detected_language", "unknown")
+            _lex_score = _lexical_plausibility(ocr_payload["text"], _lex_lang) if _lex_lang != "unknown" else None
+            gate_decisions = enforce_quality_gates(
+                ocr_quality_report, run_id=run_id,
+                lexical_plausibility=_lex_score,
+            )
             downstream_mode = gate_decisions["downstream_mode"]
             log_event(run_id, "QUALITY_GATES", "INFO", format_gate_report(gate_decisions))
 
@@ -2765,7 +2771,12 @@ async def ocr_page_with_trace(payload: SaiaFullPageExtractRequest) -> dict[str, 
                     )
                     ocr_quality_report.cross_pass_stability = cross_pass_stab
                     # Update effective quality and gate decisions with new stability
-                    gate_decisions = enforce_quality_gates(ocr_quality_report, run_id=run_id)
+                    _stab_lex_lang = ocr_payload.get("detected_language", "unknown")
+                    _stab_lex_score = _lexical_plausibility(ocr_payload["text"], _stab_lex_lang) if _stab_lex_lang != "unknown" else None
+                    gate_decisions = enforce_quality_gates(
+                        ocr_quality_report, run_id=run_id,
+                        lexical_plausibility=_stab_lex_score,
+                    )
                     effective_quality = build_effective_quality(
                         ocr_quality_report, gate_decisions,
                         confidence=ocr_payload["confidence"],
@@ -2976,7 +2987,12 @@ async def ocr_page_with_trace(payload: SaiaFullPageExtractRequest) -> dict[str, 
             )
             hardened_quality_label = post_proof_report.quality_label
             insert_ocr_quality_report(run_id, post_proof_report.to_dict())
-            gate_decisions = enforce_quality_gates(post_proof_report, run_id=run_id)
+            _pp_lex_lang = ocr_payload.get("detected_language", "unknown")
+            _pp_lex_score = _lexical_plausibility(final_pipeline_text, _pp_lex_lang) if _pp_lex_lang != "unknown" else None
+            gate_decisions = enforce_quality_gates(
+                post_proof_report, run_id=run_id,
+                lexical_plausibility=_pp_lex_score,
+            )
             downstream_mode = gate_decisions["downstream_mode"]
             ocr_payload["quality_label_v2"] = hardened_quality_label
             ocr_payload["downstream_mode"] = downstream_mode
