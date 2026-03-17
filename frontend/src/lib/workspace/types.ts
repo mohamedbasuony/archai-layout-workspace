@@ -19,6 +19,8 @@ export interface WorkspaceChatMessage {
   role: ChatRole;
   content: string;
   createdAt: number;
+  imageUrl?: string;
+  imageAlt?: string;
 }
 
 export interface WorkspacePersistedState {

@@ -55,6 +55,15 @@ class Settings(BaseSettings):
     # Backward-compatible SAIA key names (legacy config)
     archai_saia_api_key: str = ""
 
+    # RAG / ChromaDB
+    chroma_persist_dir: str = os.path.join(
+        os.path.dirname(os.path.dirname(__file__)), ".data", "chroma"
+    )
+    rag_collection_name: str = "archai_chunks"
+    rag_embedding_model: str = ""
+    rag_top_k: int = 5
+    rag_auto_index: bool = False
+
     @property
     def cors_origins_list(self) -> list[str]:
         return [o.strip() for o in self.cors_origins.split(",")]

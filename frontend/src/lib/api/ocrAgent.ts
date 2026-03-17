@@ -61,6 +61,11 @@ export interface OCRTraceTablesResponse {
   tables: OCRTraceTable[];
 }
 
+export interface OCRAuthorityReportResponse {
+  run_id: string;
+  report: string;
+}
+
 interface LegacyOCRExtractResponse {
   status: "FULL" | "PARTIAL" | "FAIL";
   model_used: string;
@@ -178,6 +183,16 @@ export async function fetchTraceTables(runId: string): Promise<OCRTraceTablesRes
     throw new Error("run_id is required for table fetch.");
   }
   return apiFetch<OCRTraceTablesResponse>(`/ocr/trace/${encodeURIComponent(clean)}/tables`, {
+    method: "GET",
+  });
+}
+
+export async function fetchAuthorityReport(runId: string): Promise<OCRAuthorityReportResponse> {
+  const clean = String(runId || "").trim();
+  if (!clean) {
+    throw new Error("run_id is required for authority report fetch.");
+  }
+  return apiFetch<OCRAuthorityReportResponse>(`/authority/report/${encodeURIComponent(clean)}`, {
     method: "GET",
   });
 }
