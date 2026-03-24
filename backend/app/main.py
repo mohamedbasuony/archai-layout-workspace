@@ -8,7 +8,7 @@ from fastapi.staticfiles import StaticFiles
 
 from app.config import settings
 from app.services.inference import init_model_pool, shutdown_model_pool
-from app.routers import health, classes, predict, download, analytics, chat, agents_ocr, ocr, evidence
+from app.routers import health, classes, predict, download, analytics, chat, agents_ocr, ocr, evidence, index, rag_debug, authority
 
 
 @asynccontextmanager
@@ -46,6 +46,9 @@ app.include_router(chat.router, prefix="/api")
 app.include_router(agents_ocr.router, prefix="/api")
 app.include_router(ocr.router, prefix="/api")
 app.include_router(evidence.router, prefix="/api")
+app.include_router(index.router, prefix="/api")
+app.include_router(rag_debug.router, prefix="/api")
+app.include_router(authority.router, prefix="/api")
 app.include_router(download.router, prefix="/api")
 app.include_router(analytics.router, prefix="/api")
 

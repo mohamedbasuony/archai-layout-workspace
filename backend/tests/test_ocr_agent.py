@@ -94,7 +94,7 @@ def test_build_ocr_messages_is_single_turn_system_and_user_with_image() -> None:
     assert "history" not in str(messages).lower()
 
 
-def test_ocr_agent_enforces_locked_model(monkeypatch: Any) -> None:
+def test_ocr_agent_falls_back_from_qwen_to_internvl(monkeypatch: Any) -> None:
     fake = _FakeSaiaClient(
         models=["qwen3-vl-30b-a3b-instruct", "internvl3.5-30b-a3b"],
         responses_by_model={"internvl3.5-30b-a3b": ["Linea una"]},
@@ -114,7 +114,7 @@ def test_ocr_agent_enforces_locked_model(monkeypatch: Any) -> None:
 
     assert result.model == "internvl3.5-30b-a3b"
     assert result.text == "Linea una"
-    assert result.fallbacksUsed == []
+    assert result.fallbacksUsed == ["qwen3-vl-30b-a3b-instruct"]
     assert fake.calls
     sent_messages = fake.calls[0]["messages"]
     assert isinstance(sent_messages, list)

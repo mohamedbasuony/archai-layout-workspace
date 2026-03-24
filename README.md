@@ -29,9 +29,10 @@ SAIA_API_KEY=...
 SAIA_BASE_URL=https://chat-ai.academiccloud.de/v1
 SAIA_TIMEOUT_SECONDS=120
 SAIA_MODELS_CACHE_TTL_SECONDS=300
-SAIA_OCR_MODEL_PREFS=qwen3-vl-30b-a3b-instruct,internvl3.5-30b-a3b,qwen2.5-vl-72b-instruct,internvl2-large
+SAIA_OCR_MODEL_PREFS=qwen3-vl-30b-a3b-instruct,internvl3.5-30b-a3b,mistral-large-3-675b-instruct-2512,gemma-3-27b-it
 SAIA_OCR_TEMPERATURE=0
-SAIA_OCR_MAX_TOKENS=3000
+SAIA_OCR_MAX_TOKENS=8192
+SAIA_MODEL_PROBE=0
 ARCHAI_CHAT_AI_MODEL=meta-llama-3.1-8b-instruct
 ```
 

@@ -34,6 +34,35 @@ def _bbox_from_polygon(polygon: list[list[float]]) -> tuple[int, int, int, int]:
     return min(xs), min(ys), max(xs), max(ys)
 
 
+def _looks_line_like(label: str | None) -> bool:
+    value = str(label or "").strip().lower()
+    return any(token in value for token in ("line", "main script", "variant script", "defaultlines", "gloss"))
+
+
+def _expand_bbox(
+    bbox: tuple[int, int, int, int],
+    *,
+    width: int,
+    height: int,
+    line_like: bool,
+) -> tuple[int, int, int, int]:
+    x1, y1, x2, y2 = bbox
+    region_w = max(1, x2 - x1)
+    region_h = max(1, y2 - y1)
+    if line_like:
+        pad_x = max(10, int(round(region_w * 0.08)))
+        pad_y = max(10, int(round(region_h * 0.45)))
+    else:
+        pad_x = max(8, int(round(region_w * 0.04)))
+        pad_y = max(8, int(round(region_h * 0.12)))
+    return (
+        max(0, x1 - pad_x),
+        max(0, y1 - pad_y),
+        min(width, x2 + pad_x),
+        min(height, y2 + pad_y),
+    )
+
+
 def crop_region(image_b64: str, region: OCRRegionInput, upscale_factor: int = 2) -> tuple[str, str]:
     image_bytes = decode_image_bytes(image_b64)
     try:
@@ -43,6 +72,8 @@ def crop_region(image_b64: str, region: OCRRegionInput, upscale_factor: int = 2)
         raise CropAgentError("Could not decode source image.") from exc
 
     width, height = source.size
+
+    line_like = _looks_line_like(getattr(region, "label", None))
 
     if region.polygon is not None:
         # Apply polygon mask first, then crop to polygon bounding box.
@@ -64,6 +95,7 @@ def crop_region(image_b64: str, region: OCRRegionInput, upscale_factor: int = 2)
     y1 = max(0, min(y1, height - 1))
     x2 = max(x1 + 1, min(x2, width))
     y2 = max(y1 + 1, min(y2, height))
+    x1, y1, x2, y2 = _expand_bbox((x1, y1, x2, y2), width=width, height=height, line_like=line_like)
 
     crop = crop_source.crop((x1, y1, x2, y2))
     if upscale_factor > 1:

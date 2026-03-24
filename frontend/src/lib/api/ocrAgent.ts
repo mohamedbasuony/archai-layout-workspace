@@ -6,14 +6,51 @@ export interface OCRLocationSuggestionPayload {
   bbox_xywh: [number, number, number, number];
 }
 
+export interface OCRRegionPayload {
+  region_id?: string;
+  bbox_xyxy?: [number, number, number, number];
+  polygon?: [number, number][];
+  label?: string;
+  reading_order?: number;
+}
+
+export interface OCRDocumentMetadataPayload {
+  language?: string;
+  year?: string;
+  place_or_origin?: string;
+  script_family?: string;
+  document_type?: string;
+  notes?: string;
+}
+
+export interface OCRComparisonRunPayload {
+  backend_name: string;
+  model_name: string;
+  selected: boolean;
+  text: string;
+  lines: string[];
+  confidence?: number | null;
+  warnings?: string[];
+  language_hint?: string | null;
+  script_family?: string | null;
+  notes?: string[];
+}
+
 export interface OCRExtractRequestPayload {
   document_id?: string;
   image_id?: string;
   page_id?: string;
   image_b64?: string;
   script_hint_seed?: string;
+  language_hint?: string;
   apply_proofread?: boolean;
+  ocr_backend?: "auto" | "saia" | "kraken" | "kraken_mccatmus" | "kraken_catmus" | "kraken_cremma_medieval" | "kraken_cremma_lat" | "calamari" | "glmocr";
+  compare_backends?: ("auto" | "saia" | "kraken" | "kraken_mccatmus" | "kraken_catmus" | "kraken_cremma_medieval" | "kraken_cremma_lat" | "calamari" | "glmocr")[];
   location_suggestions?: OCRLocationSuggestionPayload[];
+  regions?: OCRRegionPayload[];
+  metadata?: OCRDocumentMetadataPayload;
+  benchmark_text?: string;
+  benchmark_source?: string;
 }
 
 export interface OCRFallback {
@@ -33,6 +70,7 @@ export interface OCRExtractResponse {
   lines: string[];
   text: string;
   fallbacks?: OCRFallback[];
+  comparison_runs?: OCRComparisonRunPayload[];
 }
 
 export interface OCRTraceStartResponse {
@@ -59,6 +97,11 @@ export interface OCRTraceTable {
 export interface OCRTraceTablesResponse {
   run_id: string;
   tables: OCRTraceTable[];
+}
+
+export interface OCRAuthorityReportResponse {
+  run_id: string;
+  report: string;
 }
 
 interface LegacyOCRExtractResponse {
@@ -105,6 +148,7 @@ function normalizeLegacyResponse(payload: LegacyOCRExtractResponse): OCRExtractR
     lines: payload.lines ?? [],
     text: payload.text ?? "",
     fallbacks: payload.fallbacks ?? [],
+    comparison_runs: [],
   };
 }
 
@@ -127,8 +171,10 @@ export async function extractWithSaiaOcr(
           page_id: payload.page_id,
           image_b64: payload.image_b64,
           script_hint_seed: payload.script_hint_seed,
+          language_hint: payload.language_hint,
           apply_proofread: payload.apply_proofread,
           location_suggestions: payload.location_suggestions ?? [],
+          regions: payload.regions ?? [],
         }),
       });
       return normalizeLegacyResponse(legacy);
@@ -178,6 +224,16 @@ export async function fetchTraceTables(runId: string): Promise<OCRTraceTablesRes
     throw new Error("run_id is required for table fetch.");
   }
   return apiFetch<OCRTraceTablesResponse>(`/ocr/trace/${encodeURIComponent(clean)}/tables`, {
+    method: "GET",
+  });
+}
+
+export async function fetchAuthorityReport(runId: string): Promise<OCRAuthorityReportResponse> {
+  const clean = String(runId || "").trim();
+  if (!clean) {
+    throw new Error("run_id is required for authority report fetch.");
+  }
+  return apiFetch<OCRAuthorityReportResponse>(`/authority/report/${encodeURIComponent(clean)}`, {
     method: "GET",
   });
 }
