@@ -87,6 +87,15 @@ FRENCH_MIDDLE_MARKERS = {
     "pere",
 }
 ANGLO_NORMAN_MARKERS = {"anglo", "norman", "normand", "engleterre"}
+OCR_EVIDENCE_GUIDE = (
+    "INTERNAL OCR METHOD\n"
+    "- First inspect the visible letterforms, stroke shapes, spacing, abbreviation marks, and line structure.\n"
+    "- Next infer the most likely script family, language family, and genre from what is visible on the page.\n"
+    "- Only then use highly recognizable formulae as soft anchors to validate a reading.\n"
+    "- Anchor phrases are CHECKS, not sources. Never complete a known passage from memory.\n"
+    "- A proposed reading is acceptable only if it stays in the right script family, preserves plausible word boundaries, fits the visible morphology, and matches the visible strokes.\n"
+    "- If a famous biblical or liturgical passage seems likely, you may test candidate phrases against the strokes, but you must reject them if the image does not support them.\n"
+)
 
 SAIA_OCR_PROMPT_VERSION = "saia_ocr_full_page_v1"
 SAIA_OCR_SYSTEM_PROMPT = (
@@ -166,6 +175,8 @@ SAIA_OCR_SYSTEM_PROMPT = (
     "detected_language MUST be one of: latin, old_english, middle_english, french, old_french, middle_french, anglo_norman, occitan, old_high_german, middle_high_german, german, dutch, italian, spanish, portuguese, catalan, church_slavonic, greek, hebrew, arabic, mixed, unknown.\n"
     "If you feel tempted to output a known passage that is not clearly visible, STOP and output lines=[] and text=\"\" instead.\n"
     "If you are not sure a word is correct, you MUST output ? or […]; do not output a plausible-looking word without visible support."
+    "\n\n"
+    + OCR_EVIDENCE_GUIDE
 )
 SAIA_OCR_USER_PROMPT = (
     "Return JSON only.\n"
@@ -176,6 +187,8 @@ SAIA_OCR_USER_PROMPT = (
     "- Do not translate, normalize, modernize, or expand abbreviations.\n"
     "- Use uncertainty markers: ? for unclear characters, […] for unclear spans.\n"
     "- No markdown, no explanations, no extra keys.\n"
+    "- Never transcribe prompt metadata. Region ids, list numbers, category names, coordinates, tile numbers, and labels are not manuscript text.\n"
+    "- If a reading looks like a familiar biblical or liturgical formula, verify it against the visible strokes before using it.\n"
     "\n"
     "READING REMINDERS FOR GOTHIC SCRIPT:\n"
     "- This manuscript is likely in Gothic textura/bookhand. Read each letter carefully.\n"
@@ -706,7 +719,11 @@ def _format_location_suggestions(suggestions: Sequence[SaiaOCRLocationSuggestion
     if not filtered:
         filtered = list(suggestions)
 
-    lines = ["Location suggestions (x,y,w,h in full-page coordinates; hints only):", ""]
+    lines = [
+        "Location suggestions (x,y,w,h in full-page coordinates; hints only):",
+        "These hints are metadata only. Never copy ids, numbering, labels, or coordinates into the transcription.",
+        "",
+    ]
     xmins: list[float] = []
     ymins: list[float] = []
     xmaxs: list[float] = []
@@ -716,14 +733,13 @@ def _format_location_suggestions(suggestions: Sequence[SaiaOCRLocationSuggestion
         bbox = [float(v) for v in (suggestion.bbox_xywh or [])]
         if len(bbox) != 4:
             continue
-        region_id = str(suggestion.region_id or f"r{idx}")
         category = str(suggestion.category or "text")
         x, y, w, h = bbox
         xmins.append(x)
         ymins.append(y)
         xmaxs.append(x + w)
         ymaxs.append(y + h)
-        lines.append(f"{region_id} [{category}]: ({x:.1f}, {y:.1f}, {w:.1f}, {h:.1f})")
+        lines.append(f"- {category}: ({x:.1f}, {y:.1f}, {w:.1f}, {h:.1f})")
     if xmins and ymins and xmaxs and ymaxs:
         tx = min(xmins)
         ty = min(ymins)
@@ -1708,7 +1724,9 @@ def build_saia_ocr_messages(
     if location_block:
         text_prompt = (
             f"{text_prompt}\n\n"
-            "Transcribe only within the suggested text block; ignore the miniature.\n\n"
+            "Use the suggested text block only as a focus guide.\n"
+            "Do not transcribe the suggestion metadata itself.\n"
+            "Ignore decorative miniatures unless they contain letters.\n\n"
             f"{location_block}"
         )
     if repair_json:
@@ -1736,8 +1754,9 @@ def build_tile_ocr_messages(
     prevent duplication and keep output focused on visible content only."""
     system_prompt = SAIA_OCR_SYSTEM_PROMPT + SAIA_TILE_SYSTEM_ADDENDUM
     text_prompt = (
-        f"Tile {tile_index + 1} of {total_tiles}. "
-        "Transcribe ONLY what is visible in this cropped region.\n\n"
+        "This is one cropped text-bearing region from the manuscript page. "
+        "Transcribe ONLY what is visible in this crop. "
+        "Do not output any tile number or prompt metadata.\n\n"
         + SAIA_OCR_USER_PROMPT
     )
     if repair_json:

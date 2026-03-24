@@ -9,17 +9,18 @@ import {
   type ChatMessagePayload,
 } from "@/lib/api/chat";
 import {
-  extractWithSaiaOcrTrace,
+  extractWithSaiaOcr,
   fetchAuthorityReport,
-  fetchTraceTables,
   mergeOCRResultText,
-  normalizeTraceStartResponse,
+  type OCRRegionPayload,
   type OCRExtractResponse,
+  type OCRExtractRequestPayload,
 } from "@/lib/api/ocrAgent";
 import { predictSinglePage } from "@/lib/api/predict";
 import {
   type WorkspaceChatMessage,
   type WorkspaceDocument,
+  type WorkspaceDocumentMetadata,
   type WorkspacePage,
   type WorkspacePersistedState,
 } from "@/lib/workspace/types";
@@ -73,6 +74,11 @@ interface OCRLocationSuggestion {
   region_id: string;
   category: string;
   bbox_xywh: [number, number, number, number];
+}
+
+interface PendingUploadDocument {
+  baseName: string;
+  pages: WorkspacePage[];
 }
 
 function makeId(prefix: string): string {
@@ -192,12 +198,344 @@ function extractLocationSuggestions(coco: CocoPayload | null | undefined): OCRLo
   return suggestions.slice(0, 60);
 }
 
+function polygonArea(flatPoints: number[]): number {
+  if (!Array.isArray(flatPoints) || flatPoints.length < 6) {
+    return 0;
+  }
+  let area = 0;
+  for (let index = 0; index < flatPoints.length; index += 2) {
+    const nextIndex = (index + 2) % flatPoints.length;
+    area += (flatPoints[index] ?? 0) * (flatPoints[nextIndex + 1] ?? 0);
+    area -= (flatPoints[nextIndex] ?? 0) * (flatPoints[index + 1] ?? 0);
+  }
+  return Math.abs(area) / 2;
+}
+
+function bestAnnotationPolygon(annotation: CocoAnnotation): [number, number][] | undefined {
+  const polygons = annotationPolygons(annotation);
+  if (!polygons.length) {
+    return undefined;
+  }
+  const best = [...polygons].sort((left, right) => polygonArea(right) - polygonArea(left))[0] ?? null;
+  if (!best) {
+    return undefined;
+  }
+  const points: [number, number][] = [];
+  for (let index = 0; index < best.length; index += 2) {
+    const x = Number(best[index]);
+    const y = Number(best[index + 1]);
+    if (!Number.isFinite(x) || !Number.isFinite(y)) {
+      continue;
+    }
+    points.push([x, y]);
+  }
+  return points.length >= 3 ? points : undefined;
+}
+
+function regionSpecificity(label: string): number {
+  const key = label.toLowerCase();
+  if (key.includes("line")) {
+    return 0;
+  }
+  if (
+    key.includes("main script") ||
+    key.includes("variant script") ||
+    key.includes("gloss") ||
+    key.includes("header") ||
+    key.includes("catchword") ||
+    key.includes("page number") ||
+    key.includes("quire")
+  ) {
+    return 1;
+  }
+  return 2;
+}
+
+function isPreferredLineLabel(label: string): boolean {
+  const key = label.toLowerCase();
+  return key.includes("line") || key.includes("main script") || key.includes("variant script");
+}
+
+function bboxArea(bbox: [number, number, number, number]): number {
+  return Math.max(0, bbox[2] - bbox[0]) * Math.max(0, bbox[3] - bbox[1]);
+}
+
+function bboxCoverage(left: [number, number, number, number], right: [number, number, number, number]): number {
+  const interX1 = Math.max(left[0], right[0]);
+  const interY1 = Math.max(left[1], right[1]);
+  const interX2 = Math.min(left[2], right[2]);
+  const interY2 = Math.min(left[3], right[3]);
+  const interArea = Math.max(0, interX2 - interX1) * Math.max(0, interY2 - interY1);
+  const minArea = Math.max(1, Math.min(bboxArea(left), bboxArea(right)));
+  return interArea / minArea;
+}
+
+function extractStructuredRegions(coco: CocoPayload | null | undefined): OCRRegionPayload[] {
+  if (!coco) {
+    return [];
+  }
+
+  function isColumnLikeLabel(label: string): boolean {
+    const key = label.toLowerCase();
+    return /column|mainzone|main zone|text zone|main text area/.test(key);
+  }
+
+  function bboxOverlapRatio(left: [number, number, number, number], right: [number, number, number, number]): number {
+    const interX1 = Math.max(left[0], right[0]);
+    const interY1 = Math.max(left[1], right[1]);
+    const interX2 = Math.min(left[2], right[2]);
+    const interY2 = Math.min(left[3], right[3]);
+    const interArea = Math.max(0, interX2 - interX1) * Math.max(0, interY2 - interY1);
+    const leftArea = Math.max(1, bboxArea(left));
+    return interArea / leftArea;
+  }
+
+  function clusterRowsByColumns(
+    rows: Array<{
+      region_id: string;
+      label: string;
+      bbox_xyxy: [number, number, number, number];
+      polygon?: [number, number][];
+      specificity: number;
+    }>,
+    columnBoxes: Array<[number, number, number, number]>,
+  ) {
+    const assigned = new Map<number, typeof rows>();
+    for (let index = 0; index < columnBoxes.length; index += 1) {
+      assigned.set(index, []);
+    }
+    const overflow: typeof rows = [];
+    for (const row of rows) {
+      const centerX = (row.bbox_xyxy[0] + row.bbox_xyxy[2]) / 2;
+      let bestIndex = -1;
+      let bestScore = -1;
+      for (let index = 0; index < columnBoxes.length; index += 1) {
+        const columnBBox = columnBoxes[index];
+        const containsCenter = columnBBox[0] <= centerX && centerX <= columnBBox[2];
+        const overlap = bboxOverlapRatio(row.bbox_xyxy, columnBBox);
+        const score = overlap + (containsCenter ? 0.25 : 0);
+        if (score > bestScore) {
+          bestScore = score;
+          bestIndex = index;
+        }
+      }
+      if (bestIndex >= 0 && bestScore > 0.05) {
+        assigned.get(bestIndex)?.push(row);
+      } else {
+        overflow.push(row);
+      }
+    }
+    const ordered: typeof rows = [];
+    columnBoxes.forEach((_box, index) => {
+      const columnRows = [...(assigned.get(index) ?? [])].sort((left, right) => {
+        if (Math.abs(left.bbox_xyxy[1] - right.bbox_xyxy[1]) > 8) {
+          return left.bbox_xyxy[1] - right.bbox_xyxy[1];
+        }
+        return left.bbox_xyxy[0] - right.bbox_xyxy[0];
+      });
+      ordered.push(...columnRows);
+    });
+    ordered.push(...overflow.sort((left, right) => {
+      if (Math.abs(left.bbox_xyxy[1] - right.bbox_xyxy[1]) > 8) {
+        return left.bbox_xyxy[1] - right.bbox_xyxy[1];
+      }
+      return left.bbox_xyxy[0] - right.bbox_xyxy[0];
+    }));
+    return ordered;
+  }
+
+  function clusterRowsWithoutColumns(
+    rows: Array<{
+      region_id: string;
+      label: string;
+      bbox_xyxy: [number, number, number, number];
+      polygon?: [number, number][];
+      specificity: number;
+    }>,
+  ) {
+    const sortedRows = [...rows].sort((left, right) => {
+      const leftCenter = (left.bbox_xyxy[0] + left.bbox_xyxy[2]) / 2;
+      const rightCenter = (right.bbox_xyxy[0] + right.bbox_xyxy[2]) / 2;
+      if (Math.abs(leftCenter - rightCenter) > 8) {
+        return leftCenter - rightCenter;
+      }
+      return left.bbox_xyxy[1] - right.bbox_xyxy[1];
+    });
+    const pageWidth =
+      Math.max(...sortedRows.map((row) => row.bbox_xyxy[2])) -
+      Math.min(...sortedRows.map((row) => row.bbox_xyxy[0]));
+    const mergeGap = Math.max(80, pageWidth * 0.08);
+    const columns: Array<{
+      x1: number;
+      x2: number;
+      centerX: number;
+      rows: typeof rows;
+    }> = [];
+    for (const row of sortedRows) {
+      const centerX = (row.bbox_xyxy[0] + row.bbox_xyxy[2]) / 2;
+      let match: typeof columns[number] | null = null;
+      let matchDistance: number | null = null;
+      for (const column of columns) {
+        const overlap = Math.min(row.bbox_xyxy[2], column.x2) - Math.max(row.bbox_xyxy[0], column.x1);
+        const distance = overlap > 0 ? Math.abs(centerX - column.centerX) : Math.max(row.bbox_xyxy[0] - column.x2, column.x1 - row.bbox_xyxy[2], 0);
+        if (distance <= mergeGap && (matchDistance === null || distance < matchDistance)) {
+          match = column;
+          matchDistance = distance;
+        }
+      }
+      if (!match) {
+        columns.push({
+          x1: row.bbox_xyxy[0],
+          x2: row.bbox_xyxy[2],
+          centerX,
+          rows: [row],
+        });
+        continue;
+      }
+      match.rows.push(row);
+      match.x1 = Math.min(match.x1, row.bbox_xyxy[0]);
+      match.x2 = Math.max(match.x2, row.bbox_xyxy[2]);
+      match.centerX = match.rows.reduce((sum, item) => sum + (item.bbox_xyxy[0] + item.bbox_xyxy[2]) / 2, 0) / match.rows.length;
+    }
+    columns.sort((left, right) => left.x1 - right.x1);
+    return columns.flatMap((column) =>
+      [...column.rows].sort((left, right) => {
+        if (Math.abs(left.bbox_xyxy[1] - right.bbox_xyxy[1]) > 8) {
+          return left.bbox_xyxy[1] - right.bbox_xyxy[1];
+        }
+        return left.bbox_xyxy[0] - right.bbox_xyxy[0];
+      }),
+    );
+  }
+
+  const categories = Array.isArray(coco.categories) ? coco.categories : [];
+  const annotations = Array.isArray(coco.annotations) ? coco.annotations : [];
+  const categoryById = new Map<number, string>();
+  for (const category of categories) {
+    if (typeof category?.id === "number" && typeof category?.name === "string") {
+      categoryById.set(category.id, category.name);
+    }
+  }
+
+  const columnBoxes = annotations
+    .map((annotation) => {
+      if (!annotation || !Array.isArray(annotation.bbox) || annotation.bbox.length < 4) {
+        return null;
+      }
+      const label = categoryById.get(Number(annotation.category_id)) || "";
+      if (!isColumnLikeLabel(label)) {
+        return null;
+      }
+      const [x, y, w, h] = annotation.bbox;
+      if (![x, y, w, h].every((value) => Number.isFinite(value)) || w < 8 || h < 8) {
+        return null;
+      }
+      return [x, y, x + w, y + h] as [number, number, number, number];
+    })
+    .filter((value): value is [number, number, number, number] => Boolean(value))
+    .sort((left, right) => {
+      if (Math.abs(left[0] - right[0]) > 8) {
+        return left[0] - right[0];
+      }
+      return left[1] - right[1];
+    });
+
+  const candidates = annotations
+    .map((annotation) => {
+      if (!annotation || !Array.isArray(annotation.bbox) || annotation.bbox.length < 4) {
+        return null;
+      }
+      const label = categoryById.get(Number(annotation.category_id)) || "";
+      if (isColumnLikeLabel(label)) {
+        return null;
+      }
+      if (!label || !isRelevantTextLabel(label)) {
+        return null;
+      }
+      const [x, y, w, h] = annotation.bbox;
+      if (![x, y, w, h].every((value) => Number.isFinite(value)) || w < 8 || h < 8) {
+        return null;
+      }
+      return {
+        region_id: String(annotation.id),
+        label,
+        bbox_xyxy: [x, y, x + w, y + h] as [number, number, number, number],
+        polygon: bestAnnotationPolygon(annotation),
+        specificity: regionSpecificity(label),
+      };
+    })
+    .filter((value): value is {
+      region_id: string;
+      label: string;
+      bbox_xyxy: [number, number, number, number];
+      polygon?: [number, number][];
+      specificity: number;
+    } => Boolean(value));
+
+  const preferredCandidates = candidates.filter((candidate) => isPreferredLineLabel(candidate.label));
+  const workingSet = preferredCandidates.length ? preferredCandidates : candidates;
+  const preSortedWorkingSet = [...workingSet].sort((left, right) => {
+    if (left.specificity !== right.specificity) {
+      return left.specificity - right.specificity;
+    }
+    const areaDelta = bboxArea(left.bbox_xyxy) - bboxArea(right.bbox_xyxy);
+    if (Math.abs(areaDelta) > 1) {
+      return areaDelta;
+    }
+    if (Math.abs(left.bbox_xyxy[1] - right.bbox_xyxy[1]) > 8) {
+      return left.bbox_xyxy[1] - right.bbox_xyxy[1];
+    }
+    return left.bbox_xyxy[0] - right.bbox_xyxy[0];
+  });
+
+  const kept = preSortedWorkingSet.filter((candidate, index) => {
+    for (let cursor = 0; cursor < index; cursor += 1) {
+      const prior = preSortedWorkingSet[cursor];
+      if (prior.specificity > candidate.specificity) {
+        continue;
+      }
+      if (bboxCoverage(prior.bbox_xyxy, candidate.bbox_xyxy) >= 0.85) {
+        return false;
+      }
+    }
+    return true;
+  });
+
+  const ordered = columnBoxes.length
+    ? clusterRowsByColumns(kept, columnBoxes)
+    : clusterRowsWithoutColumns(kept);
+
+  return ordered.map((region, index) => ({
+    region_id: region.region_id,
+    bbox_xyxy: region.bbox_xyxy,
+    polygon: region.polygon,
+    label: region.label,
+    reading_order: index,
+  }));
+}
+
 function toBase64(dataUrl: string): string {
   const index = dataUrl.indexOf(",");
   if (index === -1) {
     return dataUrl;
   }
   return dataUrl.slice(index + 1);
+}
+
+function removeTextUncertainties(text: string): string {
+  return text
+    .split("\n")
+    .map((line) =>
+      line
+        .replace(/\[(?:…|\.{3})\]/g, "")
+        .replace(/…/g, "")
+        .replace(/\?/g, "")
+        .replace(/\s{2,}/g, " ")
+        .trim(),
+    )
+    .filter((line, index, lines) => line.length > 0 || index < lines.length - 1)
+    .join("\n")
+    .trim();
 }
 
 function formatTraceTablesForChat(payload: unknown): string {
@@ -349,6 +687,20 @@ function normalizeLabelText(text: string): string {
 }
 
 type WorkspaceIntent = "segment" | "extract" | "translate" | "entities" | "crop" | "label_analysis" | null;
+type OcrPromptHints = {
+  scriptHintSeed?: string;
+  languageHint?: string;
+  ocrBackend?: "auto" | "kraken_mccatmus" | "kraken_catmus" | "kraken_cremma_medieval" | "kraken_cremma_lat";
+};
+type ExtractionEngineCardId = "kraken" | "calamari" | "glmocr";
+const EMPTY_DOCUMENT_METADATA: WorkspaceDocumentMetadata = {
+  language: "",
+  year: "",
+  placeOrOrigin: "",
+  scriptFamily: "",
+  documentType: "",
+  notes: "",
+};
 
 function isSegmentationIntent(text: string): boolean {
   const value = normalizeCommandText(text);
@@ -374,6 +726,8 @@ function isExtractionIntent(text: string): boolean {
     value === "ocr this page" ||
     value === "run ocr" ||
     value.includes("extract text") ||
+    /\bextract\b.*\btext\b/.test(value) ||
+    /\bextract\b.*\b(manuscript|page|latin|french|english|old french|middle french|anglo norman|italian|spanish|iberian|portuguese|catalan)\b/.test(value) ||
     value.includes("transcribe") ||
     value.includes("ocr") ||
     value.includes("read the text") ||
@@ -426,6 +780,206 @@ function detectWorkspaceIntent(text: string): WorkspaceIntent {
     return "translate";
   }
   return null;
+}
+
+function extractOcrPromptHints(text: string): OcrPromptHints {
+  const value = normalizeCommandText(text);
+  if (/\banglo norman\b/.test(value)) {
+    return { languageHint: "anglo_norman", scriptHintSeed: "latin", ocrBackend: "auto" };
+  }
+  if (/\bold french\b/.test(value)) {
+    return { languageHint: "old_french", scriptHintSeed: "latin", ocrBackend: "auto" };
+  }
+  if (/\bmiddle french\b/.test(value)) {
+    return { languageHint: "middle_french", scriptHintSeed: "latin", ocrBackend: "auto" };
+  }
+  if (/\bmedieval french\b/.test(value)) {
+    return { languageHint: "middle_french", scriptHintSeed: "latin", ocrBackend: "auto" };
+  }
+  if (/\blatin\b/.test(value)) {
+    return { languageHint: "latin", scriptHintSeed: "latin", ocrBackend: "auto" };
+  }
+  if (/\bmedieval latin\b/.test(value)) {
+    return { languageHint: "latin", scriptHintSeed: "latin", ocrBackend: "auto" };
+  }
+  if (/\bfrench\b/.test(value)) {
+    return { languageHint: "french", scriptHintSeed: "latin", ocrBackend: "auto" };
+  }
+  if (/\boccitan\b|\bold occitan\b|\bprovencal\b|\bprovençal\b/.test(value)) {
+    return { languageHint: "occitan", scriptHintSeed: "latin", ocrBackend: "auto" };
+  }
+  if (/\bitalian\b/.test(value)) {
+    return { languageHint: "italian", scriptHintSeed: "latin", ocrBackend: "auto" };
+  }
+  if (/\bspanish\b|\biberian\b|\bportuguese\b|\bcatalan\b/.test(value)) {
+    return { languageHint: "spanish", scriptHintSeed: "latin", ocrBackend: "auto" };
+  }
+  if (/\bmiddle english\b/.test(value)) {
+    return { languageHint: "middle_english", scriptHintSeed: "latin", ocrBackend: "auto" };
+  }
+  if (/\bold english\b/.test(value)) {
+    return { languageHint: "old_english", scriptHintSeed: "insular_old_english", ocrBackend: "auto" };
+  }
+  if (/\bmiddle high german\b/.test(value)) {
+    return { languageHint: "middle_high_german", scriptHintSeed: "latin", ocrBackend: "auto" };
+  }
+  if (/\bold high german\b/.test(value)) {
+    return { languageHint: "old_high_german", scriptHintSeed: "latin", ocrBackend: "auto" };
+  }
+  if (/\bgerman\b|\bdutch\b|\bflemish\b/.test(value)) {
+    return { languageHint: "german", scriptHintSeed: "latin", ocrBackend: "auto" };
+  }
+  return {};
+}
+
+function metadataToOcrHints(metadata: WorkspaceDocumentMetadata | null | undefined): OcrPromptHints {
+  if (!metadata) {
+    return {};
+  }
+
+  const languageValue = normalizeCommandText(metadata.language || "");
+  const scriptValue = normalizeCommandText(metadata.scriptFamily || "");
+  const fallbackScriptHint = scriptValue.includes("insular") ? "insular_old_english" : "latin";
+
+  if (/\banglo norman\b/.test(languageValue)) {
+    return { languageHint: "anglo_norman", scriptHintSeed: "latin", ocrBackend: "auto" };
+  }
+  if (/\bold french\b/.test(languageValue)) {
+    return { languageHint: "old_french", scriptHintSeed: "latin", ocrBackend: "auto" };
+  }
+  if (/\bmiddle french\b/.test(languageValue)) {
+    return { languageHint: "middle_french", scriptHintSeed: "latin", ocrBackend: "auto" };
+  }
+  if (/\bmedieval french\b/.test(languageValue)) {
+    return { languageHint: "middle_french", scriptHintSeed: "latin", ocrBackend: "auto" };
+  }
+  if (/\blatin\b/.test(languageValue)) {
+    return { languageHint: "latin", scriptHintSeed: fallbackScriptHint, ocrBackend: "auto" };
+  }
+  if (/\bmedieval latin\b/.test(languageValue)) {
+    return { languageHint: "latin", scriptHintSeed: fallbackScriptHint, ocrBackend: "auto" };
+  }
+  if (/\bfrench\b/.test(languageValue)) {
+    return { languageHint: "french", scriptHintSeed: "latin", ocrBackend: "auto" };
+  }
+  if (/\boccitan\b|\bold occitan\b|\bprovencal\b|\bprovençal\b/.test(languageValue)) {
+    return { languageHint: "occitan", scriptHintSeed: "latin", ocrBackend: "auto" };
+  }
+  if (/\bitalian\b/.test(languageValue)) {
+    return { languageHint: "italian", scriptHintSeed: "latin", ocrBackend: "auto" };
+  }
+  if (/\bspanish\b|\biberian\b|\bportuguese\b|\bcatalan\b/.test(languageValue)) {
+    return { languageHint: "spanish", scriptHintSeed: "latin", ocrBackend: "auto" };
+  }
+  if (/\bmiddle english\b/.test(languageValue)) {
+    return { languageHint: "middle_english", scriptHintSeed: fallbackScriptHint, ocrBackend: "auto" };
+  }
+  if (/\bold english\b/.test(languageValue)) {
+    return { languageHint: "old_english", scriptHintSeed: "insular_old_english", ocrBackend: "auto" };
+  }
+  if (/\bmiddle high german\b/.test(languageValue)) {
+    return { languageHint: "middle_high_german", scriptHintSeed: "latin", ocrBackend: "auto" };
+  }
+  if (/\bold high german\b/.test(languageValue)) {
+    return { languageHint: "old_high_german", scriptHintSeed: "latin", ocrBackend: "auto" };
+  }
+  if (/\bgerman\b|\bdutch\b|\bflemish\b/.test(languageValue)) {
+    return { languageHint: "german", scriptHintSeed: "latin", ocrBackend: "auto" };
+  }
+  return scriptValue ? { scriptHintSeed: fallbackScriptHint, ocrBackend: "auto" } : {};
+}
+
+function isPrintLikeMetadata(metadata: WorkspaceDocumentMetadata | null | undefined): boolean {
+  const scriptValue = normalizeCommandText(metadata?.scriptFamily || "");
+  const typeValue = normalizeCommandText(metadata?.documentType || "");
+  const notesValue = normalizeCommandText(metadata?.notes || "");
+  return /(print|printed|imprint|fraktur|antiqua|humanistic|roman type)/.test(`${scriptValue} ${typeValue} ${notesValue}`);
+}
+
+function getExtractionEngineRecommendation(
+  userPrompt: string,
+  metadata: WorkspaceDocumentMetadata | null | undefined,
+): {
+  recommended: ExtractionEngineCardId;
+  detectedLanguage: string;
+  detectedScript: string;
+  autoRecommendation: string;
+} {
+  const hints = resolveOcrPromptHints(userPrompt, metadata);
+  const detectedLanguage = hints.languageHint || normalizeCommandText(metadata?.language || "") || "unknown";
+  const detectedScript = hints.scriptHintSeed || normalizeCommandText(metadata?.scriptFamily || "") || "unknown";
+  if (isPrintLikeMetadata(metadata)) {
+    if (/(old_french|middle_french|anglo_norman|french)/.test(detectedLanguage)) {
+      return {
+        recommended: "calamari",
+        detectedLanguage,
+        detectedScript,
+        autoRecommendation: "Calamari -> historical_french",
+      };
+    }
+    if (/(german|old_high_german|middle_high_german|dutch|flemish)/.test(detectedLanguage) || /(fraktur|blackletter)/.test(detectedScript)) {
+      return {
+        recommended: "calamari",
+        detectedLanguage,
+        detectedScript,
+        autoRecommendation: "Calamari -> fraktur_historical",
+      };
+    }
+    if (/(latin|italian|spanish|portuguese|catalan|occitan)/.test(detectedLanguage) || /(antiqua|humanistic|roman)/.test(detectedScript)) {
+      return {
+        recommended: "calamari",
+        detectedLanguage,
+        detectedScript,
+        autoRecommendation: "Calamari -> antiqua_historical / gt4histocr",
+      };
+    }
+  }
+  if (detectedLanguage === "latin") {
+    return {
+      recommended: "kraken",
+      detectedLanguage,
+      detectedScript,
+      autoRecommendation: "Kraken family -> CREMMA-Medieval-LAT, then CATMuS, then McCATMuS",
+    };
+  }
+  if (/(old_french|middle_french|anglo_norman|french)/.test(detectedLanguage)) {
+    return {
+      recommended: "kraken",
+      detectedLanguage,
+      detectedScript,
+      autoRecommendation: "Kraken family -> CREMMA Medieval, then CATMuS, then McCATMuS",
+    };
+  }
+  if (/(spanish|portuguese|catalan|iberian|italian|occitan)/.test(detectedLanguage)) {
+    return {
+      recommended: "kraken",
+      detectedLanguage,
+      detectedScript,
+      autoRecommendation: "Kraken family -> CATMuS, then McCATMuS",
+    };
+  }
+  if (/(german|old_high_german|middle_high_german|dutch|flemish|english|old_english|middle_english)/.test(detectedLanguage)) {
+    return {
+      recommended: "kraken",
+      detectedLanguage,
+      detectedScript,
+      autoRecommendation: "Kraken family -> McCATMuS, then CATMuS",
+    };
+  }
+  return {
+    recommended: "kraken",
+    detectedLanguage,
+    detectedScript,
+    autoRecommendation: "Kraken family -> CATMuS, then McCATMuS",
+  };
+}
+
+function resolveOcrPromptHints(text: string, metadata: WorkspaceDocumentMetadata | null | undefined): OcrPromptHints {
+  const promptHints = extractOcrPromptHints(text);
+  if (promptHints.languageHint || promptHints.scriptHintSeed) {
+    return promptHints;
+  }
+  return metadataToOcrHints(metadata);
 }
 
 function buildEnglishTranslationPrompt(sourceText: string): string {
@@ -658,6 +1212,15 @@ export function DocumentChatWorkspace({ initialDocumentId }: DocumentChatWorkspa
   const [authorityReportByPageId, setAuthorityReportByPageId] = useState<Record<string, string>>({});
   const [segmentingPageId, setSegmentingPageId] = useState<string | null>(null);
   const [showSegmentationOverlay, setShowSegmentationOverlay] = useState(true);
+  const [pendingUpload, setPendingUpload] = useState<PendingUploadDocument | null>(null);
+  const [metadataDraft, setMetadataDraft] = useState<WorkspaceDocumentMetadata>(EMPTY_DOCUMENT_METADATA);
+  const [metadataError, setMetadataError] = useState<string | null>(null);
+  const [showEngineSelector, setShowEngineSelector] = useState(false);
+  const [pendingExtractionOptions, setPendingExtractionOptions] = useState<{
+    userPrompt: string;
+    compareBackends?: ("calamari" | "glmocr")[];
+    ocrBackend?: "auto" | "calamari" | "glmocr";
+  } | null>(null);
   const chatScrollContainerRef = useRef<HTMLDivElement | null>(null);
   const chatScrollAnchorRef = useRef<HTMLDivElement | null>(null);
 
@@ -680,6 +1243,11 @@ export function DocumentChatWorkspace({ initialDocumentId }: DocumentChatWorkspa
   const currentOcrRunId = currentPage ? (ocrRunIdByPageId[currentPage.id] ?? "") : "";
   const currentAuthorityReport = currentPage ? (authorityReportByPageId[currentPage.id] ?? "") : "";
   const currentPageIsSegmenting = Boolean(currentPage && segmentingPageId === currentPage.id);
+  const currentMetadata = currentDocument?.metadata ?? null;
+  const extractionEngineRecommendation = getExtractionEngineRecommendation(
+    pendingExtractionOptions?.userPrompt || "",
+    currentMetadata,
+  );
 
   useEffect(() => {
     const container = chatScrollContainerRef.current;
@@ -794,24 +1362,62 @@ export function DocumentChatWorkspace({ initialDocumentId }: DocumentChatWorkspa
       );
 
       const baseName = images[0].name.replace(/\.[^.]+$/, "") || "Document";
-      const document: WorkspaceDocument = {
-        id: makeId("doc"),
-        name: pages.length > 1 ? `${baseName} (${pages.length} pages)` : baseName,
-        pages,
-        createdAt: Date.now(),
-      };
-
-      setDocuments((prev) => [document, ...prev]);
-      setPageIndexByDocument((prev) => ({ ...prev, [document.id]: 0 }));
-      setZoomByDocument((prev) => ({ ...prev, [document.id]: 1 }));
-      setMessagesByDocument((prev) => ({ ...prev, [document.id]: [] }));
-      setSelectedDocumentId(document.id);
+      setPendingUpload({ baseName, pages });
+      setMetadataDraft({
+        ...EMPTY_DOCUMENT_METADATA,
+        scriptFamily: "medieval latin script",
+        documentType: "manuscript",
+      });
+      setMetadataError(null);
     } catch (err) {
       const message = err instanceof Error ? err.message : "Failed to load selected files.";
       setError(message);
     } finally {
       event.target.value = "";
     }
+  };
+
+  const commitPendingUpload = () => {
+    if (!pendingUpload) {
+      return;
+    }
+
+    const language = metadataDraft.language.trim();
+    const year = metadataDraft.year.trim();
+    if (!language || !year) {
+      setMetadataError("Language and year are required before extraction can begin.");
+      return;
+    }
+
+    const document: WorkspaceDocument = {
+      id: makeId("doc"),
+      name: pendingUpload.pages.length > 1 ? `${pendingUpload.baseName} (${pendingUpload.pages.length} pages)` : pendingUpload.baseName,
+      pages: pendingUpload.pages,
+      createdAt: Date.now(),
+      metadata: {
+        language,
+        year,
+        placeOrOrigin: metadataDraft.placeOrOrigin.trim(),
+        scriptFamily: metadataDraft.scriptFamily.trim(),
+        documentType: metadataDraft.documentType.trim(),
+        notes: metadataDraft.notes.trim(),
+      },
+    };
+
+    setDocuments((prev) => [document, ...prev]);
+    setPageIndexByDocument((prev) => ({ ...prev, [document.id]: 0 }));
+    setZoomByDocument((prev) => ({ ...prev, [document.id]: 1 }));
+    setMessagesByDocument((prev) => ({ ...prev, [document.id]: [] }));
+    setSelectedDocumentId(document.id);
+    setPendingUpload(null);
+    setMetadataDraft(EMPTY_DOCUMENT_METADATA);
+    setMetadataError(null);
+  };
+
+  const cancelPendingUpload = () => {
+    setPendingUpload(null);
+    setMetadataDraft(EMPTY_DOCUMENT_METADATA);
+    setMetadataError(null);
   };
 
   const updateCurrentPageIndex = (next: number) => {
@@ -1037,7 +1643,8 @@ export function DocumentChatWorkspace({ initialDocumentId }: DocumentChatWorkspa
 
     if (intent === "extract") {
       appendMessages(documentId, [userMessage]);
-      await handleExtractTextInChat();
+      setPendingExtractionOptions({ userPrompt: text });
+      setShowEngineSelector(true);
       return;
     }
 
@@ -1316,12 +1923,19 @@ export function DocumentChatWorkspace({ initialDocumentId }: DocumentChatWorkspa
     }
   };
 
-  const handleExtractTextInChat = async (options?: { includeDebugOutput?: boolean; silent?: boolean }): Promise<{ text: string; runId: string; authorityReport: string } | null> => {
+  const handleExtractTextInChat = async (options?: {
+    includeDebugOutput?: boolean;
+    silent?: boolean;
+    userPrompt?: string;
+    ocrBackend?: "auto" | "calamari" | "glmocr";
+    compareBackends?: ("calamari" | "glmocr")[];
+  }): Promise<{ text: string; runId: string; authorityReport: string } | null> => {
     if (!currentPage || !currentDocument) {
       return null;
     }
     const includeDebugOutput = options?.includeDebugOutput ?? true;
     const silent = options?.silent ?? false;
+    const userPrompt = options?.userPrompt ?? "";
     const currentDocumentId = currentDocument.id;
 
     const statusMessageId = makeId("msg-status");
@@ -1363,26 +1977,71 @@ export function DocumentChatWorkspace({ initialDocumentId }: DocumentChatWorkspa
     setSending(true);
     setAssistantLoadingLabel("Extracting text");
     try {
-      setExtractionStatus("Extraction status: sending full page to SAIA OCR agent...");
+      setExtractionStatus(
+        options?.compareBackends?.length
+          ? "Extraction status: running segmentation-guided OCR comparison..."
+          : "Extraction status: running segmentation-guided OCR..."
+      );
 
       let locationSuggestions = extractLocationSuggestions(currentSegmentationCoco);
+      let structuredRegions = extractStructuredRegions(currentSegmentationCoco);
       if (!locationSuggestions.length) {
         const segmentation = await runSegmentationForCurrentPage();
         locationSuggestions = extractLocationSuggestions(segmentation?.coco ?? null);
+        structuredRegions = extractStructuredRegions(segmentation?.coco ?? null);
       }
 
-      const traceResult = await extractWithSaiaOcrTrace({
+      const ocrHints = resolveOcrPromptHints(userPrompt, currentMetadata);
+      const response = await extractWithSaiaOcr({
         document_id: currentDocumentId,
         image_id: currentDocumentId,
         page_id: currentPage.id,
         image_b64: toBase64(currentPage.dataUrl),
+        script_hint_seed: ocrHints.scriptHintSeed,
+        language_hint: ocrHints.languageHint,
+        ocr_backend: (options?.ocrBackend as OCRExtractRequestPayload["ocr_backend"]) ?? "auto",
+        compare_backends: (options?.compareBackends as OCRExtractRequestPayload["compare_backends"]) ?? [],
         location_suggestions: locationSuggestions,
-        apply_proofread: true,
+        regions: structuredRegions,
+        apply_proofread: false,
+        metadata: currentMetadata ? {
+          language: currentMetadata.language,
+          year: currentMetadata.year,
+          place_or_origin: currentMetadata.placeOrOrigin,
+          script_family: currentMetadata.scriptFamily,
+          document_type: currentMetadata.documentType,
+          notes: currentMetadata.notes,
+        } : undefined,
       });
-      const response = normalizeTraceStartResponse(traceResult);
 
-      const finalText = mergeOCRResultText(response);
-      if (!finalText) {
+      const rawExtractedText = mergeOCRResultText(response);
+      const finalText = removeTextUncertainties(rawExtractedText);
+      const comparisonText = (response.comparison_runs ?? [])
+        .map((run) => {
+          const cleaned = removeTextUncertainties(String(run.text || "").trim());
+          const warnings = (run.warnings ?? []).filter(Boolean);
+          const notes = (run.notes ?? []).filter(Boolean);
+          const confidence = typeof run.confidence === "number" ? ` confidence=${run.confidence.toFixed(3)}` : "";
+          const hintText = [run.language_hint ? `language=${run.language_hint}` : "", run.script_family ? `script=${run.script_family}` : ""]
+            .filter(Boolean)
+            .join(" ");
+          const warningText = warnings.length ? `\nWarnings: ${warnings.join("; ")}` : "";
+          const notesText = notes.length ? `\nNotes: ${notes.join("; ")}` : "";
+          return [
+            `${run.selected ? "Selected" : "Compared"} OCR: ${run.backend_name} (${run.model_name})${confidence}${hintText ? ` ${hintText}` : ""}`,
+            cleaned || "(no readable text detected)",
+            warningText,
+            notesText,
+          ].filter(Boolean).join("\n");
+        })
+        .join("\n\n---\n\n")
+        .trim();
+      const fallbackStateText = (response.comparison_runs ?? [])
+        .map((run) => removeTextUncertainties(String(run.text || "").trim()))
+        .find((value) => Boolean(value));
+      const storedText = finalText || fallbackStateText || "";
+      const hasComparisonText = Boolean(comparisonText);
+      if (!finalText && !hasComparisonText) {
         const status = getExtractionStatus(response);
         setExtractionStatus(`Extraction complete (${status}): no readable text detected.`);
         if (!silent) {
@@ -1399,75 +2058,27 @@ export function DocumentChatWorkspace({ initialDocumentId }: DocumentChatWorkspa
         return null;
       }
 
-      setOcrTextByPageId((prev) => ({ ...prev, [currentPage.id]: finalText }));
-      setOcrRunIdByPageId((prev) => ({ ...prev, [currentPage.id]: traceResult.run_id }));
+      setOcrTextByPageId((prev) => ({ ...prev, [currentPage.id]: storedText }));
+      setOcrRunIdByPageId((prev) => ({ ...prev, [currentPage.id]: "" }));
+      setAuthorityReportByPageId((prev) => ({ ...prev, [currentPage.id]: "" }));
 
       if (!silent) {
         setMessagesByDocument((prev) => ({
           ...prev,
           [currentDocumentId]: (prev[currentDocumentId] ?? []).map((msg) =>
-            msg.id === assistantMessageId ? { ...msg, content: finalText } : msg,
+            msg.id === assistantMessageId
+              ? { ...msg, content: (options?.compareBackends?.length ? comparisonText : finalText) || finalText }
+              : msg,
           ),
         }));
       }
       const status = getExtractionStatus(response);
-      let authorityReport = "";
-      try {
-        const authorityPayload = await fetchAuthorityReport(traceResult.run_id);
-        authorityReport = String(authorityPayload.report || "").trim();
-      } catch {
-        authorityReport = "";
-      }
-      if (authorityReport) {
-        setAuthorityReportByPageId((prev) => ({ ...prev, [currentPage.id]: authorityReport }));
-      }
-      if (!includeDebugOutput) {
-        setExtractionStatus(`Extraction complete (${status}).`);
-        return { text: finalText, runId: traceResult.run_id, authorityReport };
-      }
       setExtractionStatus(
-        `Extraction complete (${status}) [run_id: ${traceResult.run_id}]. Fetching DB table printout...`,
+        options?.compareBackends?.length
+          ? `Extraction comparison complete (${status}).`
+          : `Extraction complete (${status}).`
       );
-
-      try {
-        const tablePayload = await fetchTraceTables(traceResult.run_id);
-        const tableMessage: WorkspaceChatMessage = {
-          id: makeId("msg-assistant-trace-table"),
-          role: "assistant",
-          content: `Pipeline DB printout for run_id ${traceResult.run_id}:\n${formatTraceTablesForChat(tablePayload)}`,
-          createdAt: Date.now(),
-        };
-        setMessagesByDocument((prev) => ({
-          ...prev,
-          [currentDocumentId]: [...(prev[currentDocumentId] ?? []), tableMessage],
-        }));
-        const entityReport = authorityReport || formatEntityLinkingReportForChat(tablePayload);
-        const entityMessage: WorkspaceChatMessage = {
-          id: makeId("msg-assistant-entity-report"),
-          role: "assistant",
-          content: entityReport,
-          createdAt: Date.now(),
-        };
-        setMessagesByDocument((prev) => ({
-          ...prev,
-          [currentDocumentId]: [...(prev[currentDocumentId] ?? []), entityMessage],
-        }));
-        setExtractionStatus(`Extraction complete (${status}) [run_id: ${traceResult.run_id}]. DB table printout posted to chat.`);
-      } catch (tableErr: unknown) {
-        const tableErrorMessage = tableErr instanceof Error ? tableErr.message : "Failed to fetch DB table printout.";
-        const tableMessage: WorkspaceChatMessage = {
-          id: makeId("msg-assistant-trace-table-error"),
-          role: "assistant",
-          content: `Run ${traceResult.run_id} completed, but DB table printout failed: ${tableErrorMessage}`,
-          createdAt: Date.now(),
-        };
-        setMessagesByDocument((prev) => ({
-          ...prev,
-          [currentDocumentId]: [...(prev[currentDocumentId] ?? []), tableMessage],
-        }));
-        setExtractionStatus(`Extraction complete (${status}) [run_id: ${traceResult.run_id}], but DB table fetch failed.`);
-      }
-      return { text: finalText, runId: traceResult.run_id, authorityReport };
+      return { text: storedText, runId: "", authorityReport: "" };
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : "request failed";
       setExtractionStatus(`Extraction failed: ${message}`);
@@ -1606,6 +2217,19 @@ export function DocumentChatWorkspace({ initialDocumentId }: DocumentChatWorkspa
             {!documents.length && <p className="text-sm text-muted-foreground">No documents loaded.</p>}
           </div>
         </div>
+
+        {currentMetadata ? (
+          <div className="border-b p-3 text-xs text-muted-foreground">
+            <p className="mb-2 font-medium uppercase tracking-wide">Metadata</p>
+            <div className="space-y-1">
+              <p><span className="font-medium text-foreground">Language:</span> {currentMetadata.language}</p>
+              <p><span className="font-medium text-foreground">Year:</span> {currentMetadata.year}</p>
+              {currentMetadata.placeOrOrigin ? <p><span className="font-medium text-foreground">Origin:</span> {currentMetadata.placeOrOrigin}</p> : null}
+              {currentMetadata.scriptFamily ? <p><span className="font-medium text-foreground">Script:</span> {currentMetadata.scriptFamily}</p> : null}
+              {currentMetadata.documentType ? <p><span className="font-medium text-foreground">Type:</span> {currentMetadata.documentType}</p> : null}
+            </div>
+          </div>
+        ) : null}
 
         <div className="flex min-h-0 flex-1 flex-col p-3">
           <p className="mb-2 text-xs font-medium uppercase tracking-wide text-muted-foreground">Current Page</p>
@@ -1834,6 +2458,194 @@ export function DocumentChatWorkspace({ initialDocumentId }: DocumentChatWorkspa
           </div>
         </div>
       </section>
+      {pendingUpload ? (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 px-4">
+          <div className="w-full max-w-2xl rounded-xl border bg-background p-6 shadow-2xl">
+            <h2 className="text-lg font-semibold">Document metadata</h2>
+            <p className="mt-1 text-sm text-muted-foreground">
+              Language and year are required. These values will guide Kraken routing now and stay with the document for later retrieval and entity work.
+            </p>
+            <div className="mt-4 grid gap-4 md:grid-cols-2">
+              <label className="text-sm">
+                <span className="mb-1 block font-medium">Language</span>
+                <input
+                  value={metadataDraft.language}
+                  onChange={(event) => setMetadataDraft((prev) => ({ ...prev, language: event.target.value }))}
+                  placeholder="latin, middle_french, anglo_norman..."
+                  className="w-full rounded-md border bg-background px-3 py-2 outline-none focus:ring-2 focus:ring-primary/40"
+                />
+              </label>
+              <label className="text-sm">
+                <span className="mb-1 block font-medium">Year</span>
+                <input
+                  value={metadataDraft.year}
+                  onChange={(event) => setMetadataDraft((prev) => ({ ...prev, year: event.target.value }))}
+                  placeholder="e.g. 1248 or c. 1250"
+                  className="w-full rounded-md border bg-background px-3 py-2 outline-none focus:ring-2 focus:ring-primary/40"
+                />
+              </label>
+              <label className="text-sm">
+                <span className="mb-1 block font-medium">Place / origin</span>
+                <input
+                  value={metadataDraft.placeOrOrigin}
+                  onChange={(event) => setMetadataDraft((prev) => ({ ...prev, placeOrOrigin: event.target.value }))}
+                  placeholder="Lausanne, Paris, Toledo..."
+                  className="w-full rounded-md border bg-background px-3 py-2 outline-none focus:ring-2 focus:ring-primary/40"
+                />
+              </label>
+              <label className="text-sm">
+                <span className="mb-1 block font-medium">Script family</span>
+                <input
+                  value={metadataDraft.scriptFamily}
+                  onChange={(event) => setMetadataDraft((prev) => ({ ...prev, scriptFamily: event.target.value }))}
+                  placeholder="medieval latin script, caroline, textualis..."
+                  className="w-full rounded-md border bg-background px-3 py-2 outline-none focus:ring-2 focus:ring-primary/40"
+                />
+              </label>
+              <label className="text-sm md:col-span-2">
+                <span className="mb-1 block font-medium">Document type</span>
+                <input
+                  value={metadataDraft.documentType}
+                  onChange={(event) => setMetadataDraft((prev) => ({ ...prev, documentType: event.target.value }))}
+                  placeholder="gospel, charter, cartulary, liturgical manuscript..."
+                  className="w-full rounded-md border bg-background px-3 py-2 outline-none focus:ring-2 focus:ring-primary/40"
+                />
+              </label>
+              <label className="text-sm md:col-span-2">
+                <span className="mb-1 block font-medium">Notes</span>
+                <textarea
+                  value={metadataDraft.notes}
+                  onChange={(event) => setMetadataDraft((prev) => ({ ...prev, notes: event.target.value }))}
+                  rows={4}
+                  placeholder="Repository, shelfmark, dating notes, provenance, paleography notes..."
+                  className="w-full rounded-md border bg-background px-3 py-2 outline-none focus:ring-2 focus:ring-primary/40"
+                />
+              </label>
+            </div>
+            {metadataError ? <p className="mt-3 text-sm text-red-600">{metadataError}</p> : null}
+            <div className="mt-5 flex justify-end gap-2">
+              <button
+                type="button"
+                onClick={cancelPendingUpload}
+                className="rounded-md border px-4 py-2 text-sm hover:bg-accent"
+              >
+                Cancel upload
+              </button>
+              <button
+                type="button"
+                onClick={commitPendingUpload}
+                className="rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:bg-primary/90"
+              >
+                Save metadata and open document
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
+      {showEngineSelector && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 px-4">
+          <div className="w-full max-w-3xl rounded-xl border bg-background p-6 shadow-2xl">
+            <h3 className="text-lg font-semibold mb-1">Select OCR Engine</h3>
+            <p className="text-sm text-muted-foreground mb-4">
+              Choose which recognition engine to use for text extraction. Detected language/script hint:
+              {` ${extractionEngineRecommendation.detectedLanguage || "unknown"}`}
+              {extractionEngineRecommendation.detectedScript && extractionEngineRecommendation.detectedScript !== "unknown"
+                ? ` / ${extractionEngineRecommendation.detectedScript}`
+                : ""}
+              . Auto recommendation: {extractionEngineRecommendation.autoRecommendation}.
+            </p>
+            <div className="grid gap-3 md:grid-cols-3">
+              <button
+                type="button"
+                onClick={() => {
+                  setShowEngineSelector(false);
+                  handleExtractTextInChat({ ...pendingExtractionOptions, ocrBackend: "auto", compareBackends: [] });
+                  setPendingExtractionOptions(null);
+                }}
+                className={`rounded-lg border p-4 hover:bg-muted transition text-left ${
+                  extractionEngineRecommendation.recommended === "kraken" ? "border-primary ring-2 ring-primary/30" : ""
+                }`}
+              >
+                <div className="flex items-center justify-between gap-2">
+                  <div className="font-medium">Kraken family</div>
+                  <span className="rounded-full bg-primary/10 px-2 py-0.5 text-[11px] font-medium text-primary">Recommended</span>
+                </div>
+                <div className="text-xs text-muted-foreground mt-2">
+                  Best manuscript OCR path in this repo using segmented line crops and medieval-trained models.
+                </div>
+                <div className="text-xs mt-2"><span className="font-medium">Best for:</span> Latin, Old French, Middle French, Anglo-Norman</div>
+                <div className="text-xs mt-1"><span className="font-medium">Also good for:</span> Spanish/Iberian, Italian</div>
+                <div className="text-xs mt-2 text-muted-foreground">
+                  Best choice for medieval handwritten Latin-script material. Uses segmentation-driven line OCR.
+                </div>
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  setShowEngineSelector(false);
+                  handleExtractTextInChat({ ...pendingExtractionOptions, ocrBackend: "calamari", compareBackends: [] });
+                  setPendingExtractionOptions(null);
+                }}
+                className={`rounded-lg border p-4 hover:bg-muted transition text-left ${
+                  extractionEngineRecommendation.recommended === "calamari" ? "border-primary ring-2 ring-primary/30" : ""
+                }`}
+              >
+                <div className="flex items-center justify-between gap-2">
+                  <div className="font-medium">Calamari</div>
+                  <span className="rounded-full bg-muted px-2 py-0.5 text-[11px] font-medium text-muted-foreground">Historical print baseline</span>
+                </div>
+                <div className="text-xs text-muted-foreground mt-2">
+                  Line OCR backend best suited to historical print and broad fallback experiments.
+                </div>
+                <div className="text-xs mt-2"><span className="font-medium">Best for:</span> historical printed German/Fraktur, historical printed Latin, later historical printed French</div>
+                <div className="text-xs mt-2 text-muted-foreground">
+                  Not the best default for medieval handwritten manuscripts. Useful for comparison and print-like material.
+                </div>
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  setShowEngineSelector(false);
+                  handleExtractTextInChat({ ...pendingExtractionOptions, ocrBackend: "glmocr", compareBackends: [] });
+                  setPendingExtractionOptions(null);
+                }}
+                className="rounded-lg border p-4 hover:bg-muted transition text-left"
+              >
+                <div className="flex items-center justify-between gap-2">
+                  <div className="font-medium">GLM-OCR</div>
+                  <span className="rounded-full bg-amber-500/10 px-2 py-0.5 text-[11px] font-medium text-amber-700">Experimental</span>
+                </div>
+                <div className="text-xs text-muted-foreground mt-2">
+                  General multimodal OCR for full-page or column-level document extraction.
+                </div>
+                <div className="text-xs mt-2"><span className="font-medium">Best for:</span> broad multilingual documents, complex modern layouts, page/column OCR experiments</div>
+                <div className="text-xs mt-2 text-muted-foreground">
+                  Not specialized for medieval manuscript line transcription.
+                </div>
+              </button>
+            </div>
+            <button
+              type="button"
+              onClick={() => {
+                setShowEngineSelector(false);
+                handleExtractTextInChat({ ...pendingExtractionOptions, ocrBackend: "auto", compareBackends: ["calamari", "glmocr"] });
+                setPendingExtractionOptions(null);
+              }}
+              className="mt-4 w-full rounded-lg border p-4 text-left hover:bg-muted transition"
+            >
+              <div className="font-medium">Compare all three</div>
+              <div className="text-xs text-muted-foreground mt-1">Run Kraken family, Calamari, and GLM-OCR together and return the three assembled transcriptions with backend, model, warnings, and confidence metadata.</div>
+            </button>
+            <button
+              type="button"
+              onClick={() => { setShowEngineSelector(false); setPendingExtractionOptions(null); }}
+              className="mt-4 text-sm text-muted-foreground hover:underline"
+            >
+              Cancel
+            </button>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

@@ -484,6 +484,12 @@ def enforce_quality_gates(
         if not gates["LEXICAL_PLAUSIBILITY"]["passed"]:
             blocked.extend(["token_search", "token_ner"])
 
+    if quality_report.quality_label in {"RISKY", "UNRELIABLE"}:
+        blocked.extend(["translation", "paraphrase", "entity_claims", "no_entity_claims"])
+
+    if quality_report.quality_label == "UNRELIABLE":
+        blocked.extend(["token_search", "token_ner"])
+
     downstream = decide_downstream_mode(quality_report.quality_label)
 
     return {

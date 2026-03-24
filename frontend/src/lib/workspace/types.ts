@@ -7,11 +7,21 @@ export interface WorkspacePage {
   mimeType: string;
 }
 
+export interface WorkspaceDocumentMetadata {
+  language: string;
+  year: string;
+  placeOrOrigin: string;
+  scriptFamily: string;
+  documentType: string;
+  notes: string;
+}
+
 export interface WorkspaceDocument {
   id: string;
   name: string;
   pages: WorkspacePage[];
   createdAt: number;
+  metadata: WorkspaceDocumentMetadata;
 }
 
 export interface WorkspaceChatMessage {

@@ -257,6 +257,36 @@ def _init_db_if_needed() -> None:
 
                 CREATE INDEX IF NOT EXISTS idx_ocr_attempts_run_id ON ocr_attempts(run_id);
                 CREATE INDEX IF NOT EXISTS idx_ocr_attempts_run_idx ON ocr_attempts(run_id, attempt_idx);
+
+                CREATE TABLE IF NOT EXISTS ocr_backend_results (
+                    result_id TEXT PRIMARY KEY,
+                    run_id TEXT NOT NULL,
+                    page_id TEXT NULL,
+                    region_id TEXT NOT NULL,
+                    backend_name TEXT NOT NULL,
+                    model_name TEXT NULL,
+                    confidence REAL NULL,
+                    selected INTEGER NOT NULL DEFAULT 0,
+                    text TEXT NULL,
+                    raw_json TEXT NULL,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY(run_id) REFERENCES pipeline_runs(run_id) ON DELETE CASCADE
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_ocr_backend_results_run_id ON ocr_backend_results(run_id);
+                CREATE INDEX IF NOT EXISTS idx_ocr_backend_results_run_region ON ocr_backend_results(run_id, region_id);
+
+                CREATE TABLE IF NOT EXISTS ocr_benchmark_references (
+                    benchmark_id TEXT PRIMARY KEY,
+                    run_id TEXT NOT NULL,
+                    page_id TEXT NULL,
+                    source_label TEXT NULL,
+                    reference_text TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY(run_id) REFERENCES pipeline_runs(run_id) ON DELETE CASCADE
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_ocr_benchmark_references_run_id ON ocr_benchmark_references(run_id);
                 """
             )
             _ensure_run_columns(conn)
@@ -946,6 +976,18 @@ def table_view_for_entity_attempts(run_id: str) -> dict[str, Any]:
     return {"table": "entity_attempts", "columns": columns, "rows": values}
 
 
+def table_view_for_ocr_backend_results(run_id: str) -> dict[str, Any]:
+    _init_db_if_needed()
+    with _connect() as conn:
+        columns = _table_columns(conn, "ocr_backend_results")
+        rows = conn.execute(
+            "SELECT * FROM ocr_backend_results WHERE run_id=? ORDER BY created_at ASC, region_id ASC",
+            (run_id,),
+        ).fetchall()
+    values = [[row[col] for col in columns] for row in rows]
+    return {"table": "ocr_backend_results", "columns": columns, "rows": values}
+
+
 # ── OCR quality reports ──────────────────────────────────────────────
 
 
@@ -1222,3 +1264,95 @@ def get_best_ocr_attempt(run_id: str) -> dict[str, Any] | None:
     d["gates_passed"] = bool(d.get("gates_passed", 0))
     d["noop_detected"] = bool(d.get("noop_detected", 0))
     return d
+
+
+def insert_ocr_backend_results(run_id: str, rows: list[dict[str, Any]]) -> list[str]:
+    _init_db_if_needed()
+    inserted: list[str] = []
+    with _connect() as conn:
+        for row in rows:
+            result_id = str(row.get("result_id") or uuid.uuid4())
+            raw_json = row.get("raw_json")
+            if raw_json is not None and not isinstance(raw_json, str):
+                try:
+                    raw_json = json.dumps(raw_json, ensure_ascii=False)
+                except Exception:
+                    raw_json = None
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO ocr_backend_results (
+                    result_id, run_id, page_id, region_id, backend_name,
+                    model_name, confidence, selected, text, raw_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    result_id,
+                    run_id,
+                    row.get("page_id"),
+                    row.get("region_id"),
+                    row.get("backend_name"),
+                    row.get("model_name"),
+                    row.get("confidence"),
+                    1 if row.get("selected") else 0,
+                    row.get("text"),
+                    raw_json,
+                    now_iso(),
+                ),
+            )
+            inserted.append(result_id)
+        conn.commit()
+    return inserted
+
+
+def insert_ocr_benchmark_reference(
+    run_id: str,
+    *,
+    page_id: str | None,
+    source_label: str | None,
+    reference_text: str,
+) -> str:
+    _init_db_if_needed()
+    benchmark_id = str(uuid.uuid4())
+    with _connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO ocr_benchmark_references (
+                benchmark_id, run_id, page_id, source_label, reference_text, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                benchmark_id,
+                run_id,
+                page_id,
+                source_label,
+                reference_text,
+                now_iso(),
+            ),
+        )
+        conn.commit()
+    return benchmark_id
+
+
+def list_ocr_benchmark_references(run_id: str) -> list[dict[str, Any]]:
+    _init_db_if_needed()
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT * FROM ocr_benchmark_references WHERE run_id=? ORDER BY created_at ASC",
+            (run_id,),
+        ).fetchall()
+    return [{key: row[key] for key in row.keys()} for row in rows]
+
+
+def list_ocr_backend_results(run_id: str) -> list[dict[str, Any]]:
+    _init_db_if_needed()
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT * FROM ocr_backend_results WHERE run_id=? ORDER BY created_at ASC, region_id ASC",
+            (run_id,),
+        ).fetchall()
+    results: list[dict[str, Any]] = []
+    for row in rows:
+        data = {key: row[key] for key in row.keys()}
+        data["selected"] = bool(data.get("selected", 0))
+        results.append(data)
+    return results

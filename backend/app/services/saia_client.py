@@ -107,13 +107,23 @@ class SaiaClient:
         top_p: float | None = None,
         max_tokens: int | None = None,
         response_format: dict[str, Any] | None = None,
+        deterministic: bool = False,
     ) -> dict[str, Any]:
+        if deterministic:
+            temperature = 0.0
+            top_p = 1.0 if top_p is None else top_p
+
         payload: dict[str, Any] = {
             "model": model,
             "messages": list(messages),
             "temperature": float(temperature),
             "stream": False,
         }
+        if deterministic:
+            payload["n"] = 1
+            payload["frequency_penalty"] = 0.0
+            payload["presence_penalty"] = 0.0
+            payload["extra_body"] = {"do_sample": False}
         if top_p is not None:
             payload["top_p"] = float(top_p)
         if max_tokens is not None:
@@ -121,7 +131,20 @@ class SaiaClient:
         if response_format is not None:
             payload["response_format"] = response_format
 
-        response = self._client.chat.completions.create(**payload)
+        try:
+            response = self._client.chat.completions.create(**payload)
+        except Exception as exc:
+            lowered = str(exc).lower()
+            if deterministic and (
+                "do_sample" in lowered
+                or "extra_body" in lowered
+                or "unknown field" in lowered
+                or "unexpected keyword" in lowered
+            ):
+                payload.pop("extra_body", None)
+                response = self._client.chat.completions.create(**payload)
+            else:
+                raise
         choices = list(getattr(response, "choices", []) or [])
         if not choices:
             return {"text": "", "raw": response}

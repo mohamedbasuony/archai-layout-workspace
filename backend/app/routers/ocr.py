@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+from collections import defaultdict
 import hashlib
+import io
 import json
 import re
 import tempfile
@@ -25,6 +28,7 @@ from app.db.pipeline_db import (
     create_run,
     get_run,
     insert_chunks,
+    insert_ocr_benchmark_reference,
     insert_entity_attempts,
     insert_entity_candidates,
     insert_entity_decisions,
@@ -42,12 +46,15 @@ from app.db.pipeline_db import (
     table_view_for_entity_decisions,
     table_view_for_entity_mentions,
     table_view_for_events,
+    table_view_for_ocr_backend_results,
     table_view_for_run,
     update_run_fields,
 )
 from app.routers.predict import _prepare_image_for_segmentation
-from app.schemas.agents_ocr import OCRExtractAnyResponse, OCRExtractRequest
+from app.schemas.agents_ocr import OCRComparisonSummary, OCRExtractAnyResponse, OCRExtractOptions, OCRExtractRequest
 from app.schemas.agents_ocr import (
+    OCRExtractResponse,
+    OCRRegionInput,
     SaiaFullPageExtractRequest,
     SaiaFullPageExtractResponse,
     SaiaOCRLocationSuggestion,
@@ -90,6 +97,7 @@ from app.services.seam_strategies import (
     select_retry_strategy,
 )
 from app.db.pipeline_db import (
+    insert_ocr_backend_results,
     insert_ocr_quality_report,
     list_ocr_quality_reports,
     insert_ocr_attempt,
@@ -158,6 +166,8 @@ def _run_authority_linking_stage(run_id: str) -> dict[str, Any] | None:
 
 _TEXT_LABEL_INCLUDE_TOKENS = (
     "main script",
+    "main text",
+    "main script block",
     "variant script",
     "plain initial",
     "historiated",
@@ -2013,6 +2023,201 @@ def _extract_location_suggestions(coco: dict[str, Any] | None) -> list[SaiaOCRLo
     return suggestions[:80]
 
 
+def _annotation_polygon(annotation: dict[str, Any]) -> list[list[float]] | None:
+    segmentation = annotation.get("segmentation")
+    if not isinstance(segmentation, list) or not segmentation:
+        return None
+    coords = segmentation[0] if isinstance(segmentation[0], list) else segmentation
+    if not isinstance(coords, list) or len(coords) < 6 or len(coords) % 2 != 0:
+        return None
+    points: list[list[float]] = []
+    for idx in range(0, len(coords), 2):
+        try:
+            points.append([float(coords[idx]), float(coords[idx + 1])])
+        except Exception:
+            return None
+    return points or None
+
+
+def _extract_segmented_regions(coco: dict[str, Any] | None) -> list[OCRRegionInput]:
+    if not isinstance(coco, dict):
+        return []
+
+    categories = coco.get("categories")
+    annotations = coco.get("annotations")
+    if not isinstance(categories, list) or not isinstance(annotations, list):
+        return []
+
+    category_by_id: dict[int, str] = {}
+    for category in categories:
+        if not isinstance(category, dict):
+            continue
+        try:
+            category_id = int(category.get("id"))
+        except Exception:
+            continue
+        category_name = str(category.get("name") or "").strip()
+        if category_name:
+            category_by_id[category_id] = category_name
+
+    def _is_column_like_label(label: str) -> bool:
+        key = str(label or "").strip().lower()
+        return any(token in key for token in ("column", "mainzone", "main zone", "text zone", "main text area"))
+
+    def _bbox_overlap_ratio(left: tuple[float, float, float, float], right: tuple[float, float, float, float]) -> float:
+        inter_x1 = max(left[0], right[0])
+        inter_y1 = max(left[1], right[1])
+        inter_x2 = min(left[2], right[2])
+        inter_y2 = min(left[3], right[3])
+        inter_area = max(0.0, inter_x2 - inter_x1) * max(0.0, inter_y2 - inter_y1)
+        left_area = max(1.0, (left[2] - left[0]) * (left[3] - left[1]))
+        return inter_area / left_area
+
+    def _cluster_rows_by_columns(
+        text_rows: list[tuple[float, float, str, tuple[float, float, float, float], OCRRegionInput]],
+        column_boxes: list[tuple[float, float, float, float]],
+    ) -> list[tuple[float, float, str, tuple[float, float, float, float], OCRRegionInput]]:
+        if not text_rows:
+            return []
+
+        assigned: dict[int, list[tuple[float, float, str, tuple[float, float, float, float], OCRRegionInput]]] = {
+            index: [] for index in range(len(column_boxes))
+        }
+        overflow: list[tuple[float, float, str, tuple[float, float, float, float], OCRRegionInput]] = []
+
+        for row in text_rows:
+            bbox = row[3]
+            center_x = (bbox[0] + bbox[2]) / 2.0
+            best_index = -1
+            best_score = -1.0
+            for index, column_bbox in enumerate(column_boxes):
+                contains_center = column_bbox[0] <= center_x <= column_bbox[2]
+                overlap = _bbox_overlap_ratio(bbox, column_bbox)
+                score = overlap + (0.25 if contains_center else 0.0)
+                if score > best_score:
+                    best_score = score
+                    best_index = index
+            if best_index >= 0 and best_score > 0.05:
+                assigned[best_index].append(row)
+            else:
+                overflow.append(row)
+
+        ordered_rows: list[tuple[float, float, str, tuple[float, float, float, float], OCRRegionInput]] = []
+        for index, column_bbox in enumerate(column_boxes):
+            column_rows = sorted(assigned[index], key=lambda item: (item[3][1], item[3][0]))
+            ordered_rows.extend(column_rows)
+        ordered_rows.extend(sorted(overflow, key=lambda item: (item[3][1], item[3][0])))
+        return ordered_rows
+
+    def _cluster_rows_without_columns(
+        text_rows: list[tuple[float, float, str, tuple[float, float, float, float], OCRRegionInput]]
+    ) -> list[tuple[float, float, str, tuple[float, float, float, float], OCRRegionInput]]:
+        if not text_rows:
+            return []
+        sorted_rows = sorted(text_rows, key=lambda item: ((item[3][0] + item[3][2]) / 2.0, item[3][1]))
+        page_width = max((row[3][2] for row in sorted_rows), default=0.0) - min((row[3][0] for row in sorted_rows), default=0.0)
+        merge_gap = max(80.0, page_width * 0.08)
+        columns: list[dict[str, Any]] = []
+        for row in sorted_rows:
+            bbox = row[3]
+            center_x = (bbox[0] + bbox[2]) / 2.0
+            matched = None
+            matched_distance = None
+            for column in columns:
+                overlap = min(bbox[2], column["x2"]) - max(bbox[0], column["x1"])
+                if overlap > 0:
+                    distance = abs(center_x - column["center_x"])
+                else:
+                    distance = max(bbox[0] - column["x2"], column["x1"] - bbox[2], 0.0)
+                if distance <= merge_gap and (matched_distance is None or distance < matched_distance):
+                    matched = column
+                    matched_distance = distance
+            if matched is None:
+                columns.append({
+                    "x1": bbox[0],
+                    "x2": bbox[2],
+                    "center_x": center_x,
+                    "rows": [row],
+                })
+                continue
+            matched["rows"].append(row)
+            matched["x1"] = min(matched["x1"], bbox[0])
+            matched["x2"] = max(matched["x2"], bbox[2])
+            matched["center_x"] = sum((item[3][0] + item[3][2]) / 2.0 for item in matched["rows"]) / len(matched["rows"])
+
+        columns.sort(key=lambda column: column["x1"])
+        ordered_rows: list[tuple[float, float, str, tuple[float, float, float, float], OCRRegionInput]] = []
+        for column in columns:
+            ordered_rows.extend(sorted(column["rows"], key=lambda item: (item[3][1], item[3][0])))
+        return ordered_rows
+
+    rows: list[tuple[float, float, str, tuple[float, float, float, float], OCRRegionInput]] = []
+    column_boxes: list[tuple[float, float, float, float]] = []
+    for annotation in annotations:
+        if not isinstance(annotation, dict):
+            continue
+        bbox = annotation.get("bbox")
+        if not isinstance(bbox, list) or len(bbox) < 4:
+            continue
+        try:
+            x, y, w, h = [float(bbox[idx]) for idx in range(4)]
+        except Exception:
+            continue
+        if w < 8 or h < 8:
+            continue
+
+        category_name = category_by_id.get(int(annotation.get("category_id") or -1), "")
+        bbox_xyxy = (x, y, x + w, y + h)
+        if _is_column_like_label(category_name):
+            column_boxes.append(bbox_xyxy)
+            continue
+        if not _is_relevant_text_label(category_name):
+            continue
+
+        polygon = _annotation_polygon(annotation)
+        region = OCRRegionInput(
+            region_id=str(annotation.get("id") or f"region-{len(rows) + 1}"),
+            bbox_xyxy=[x, y, x + w, y + h],
+            polygon=polygon,
+            label=category_name or None,
+            reading_order=len(rows),
+        )
+        rows.append((y, x, category_name, bbox_xyxy, region))
+
+    preferred_rows = [
+        item for item in rows
+        if any(token in item[2].lower() for token in ("line", "main script", "variant script"))
+    ]
+    working_rows = preferred_rows or rows
+    if column_boxes:
+        column_boxes.sort(key=lambda item: (item[0], item[1]))
+        working_rows = _cluster_rows_by_columns(working_rows, column_boxes)
+    else:
+        working_rows = _cluster_rows_without_columns(working_rows)
+    return [
+        region.model_copy(update={"reading_order": idx})
+        for idx, (_y, _x, _label, _bbox, region) in enumerate(working_rows)
+    ]
+
+
+def _regions_from_location_suggestions(suggestions: list[SaiaOCRLocationSuggestion]) -> list[OCRRegionInput]:
+    regions: list[OCRRegionInput] = []
+    for idx, suggestion in enumerate(suggestions):
+        bbox = list(getattr(suggestion, "bbox_xywh", []) or [])
+        if len(bbox) < 4:
+            continue
+        x, y, w, h = [float(item) for item in bbox[:4]]
+        regions.append(
+            OCRRegionInput(
+                region_id=suggestion.region_id or f"region-{idx + 1}",
+                bbox_xyxy=[x, y, x + w, y + h],
+                label=suggestion.category,
+                reading_order=idx,
+            )
+        )
+    return regions
+
+
 def _run_segmentation_for_suggestions(image_bytes: bytes) -> list[SaiaOCRLocationSuggestion]:
     with tempfile.TemporaryDirectory() as tmp_dir:
         source_path = Path(tmp_dir) / "ocr_full_page_input"
@@ -2036,6 +2241,31 @@ def _run_segmentation_for_suggestions(image_bytes: bytes) -> list[SaiaOCRLocatio
                     pass
 
     return _extract_location_suggestions(coco)
+
+
+def _run_segmentation_for_regions(image_bytes: bytes) -> list[OCRRegionInput]:
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        source_path = Path(tmp_dir) / "ocr_full_page_input"
+        source_path.write_bytes(image_bytes)
+
+        prepared_path, prepared_changed = _prepare_image_for_segmentation(str(source_path))
+        try:
+            annotated_path = str(Path(tmp_dir) / "annotated.jpg")
+            coco, _stats = run_single_segmentation(
+                prepared_path,
+                confidence=0.25,
+                iou=0.3,
+                selected_classes=FINAL_CLASSES,
+                annotated_output_path=annotated_path,
+            )
+        finally:
+            if prepared_changed and prepared_path.endswith(".seg.jpg"):
+                try:
+                    Path(prepared_path).unlink(missing_ok=True)
+                except Exception:
+                    pass
+
+    return _extract_segmented_regions(coco)
 
 
 def _detect_language_metadata(text: str) -> tuple[str, float | None]:
@@ -2190,6 +2420,687 @@ def _build_trace_snapshot(run_id: str) -> dict[str, Any] | None:
     }
 
 
+def _map_extract_script_hint_to_full_page(value: str | None) -> str:
+    hint = str(value or "unknown").strip().lower()
+    if hint == "latin_medieval":
+        return "latin"
+    if hint in {"latin", "greek", "cyrillic", "mixed", "unknown"}:
+        return hint
+    return "unknown"
+
+
+def _strip_uncertainty_markers(text: str) -> str:
+    return (
+        str(text or "")
+        .replace("[…]", "")
+        .replace("[...]", "")
+        .replace("…", "")
+        .replace("?", "")
+    )
+
+
+def _strip_uncertainty_lines(lines: list[str]) -> list[str]:
+    cleaned: list[str] = []
+    for line in lines:
+        value = re.sub(r"\s{2,}", " ", _strip_uncertainty_markers(line)).strip()
+        if value:
+            cleaned.append(value)
+    return cleaned
+
+
+def _build_segmented_extract_request(
+    payload: SaiaFullPageExtractRequest,
+    regions: list[OCRRegionInput],
+) -> OCRExtractRequest:
+    effective_language_hint = str(
+        payload.language_hint
+        or (payload.metadata.language if payload.metadata and payload.metadata.language else "unknown")
+    )
+    return OCRExtractRequest(
+        image_id=payload.image_id,
+        page_id=payload.page_id,
+        image_b64=payload.image_b64,
+        regions=regions,
+        mode="full",
+        options=OCRExtractOptions(
+            language_hint=effective_language_hint,
+            apply_proofread=payload.apply_proofread,
+            backend=payload.ocr_backend,
+            compare_backends=list(payload.compare_backends),
+        ),
+        metadata=payload.metadata,
+        benchmark_text=payload.benchmark_text,
+        benchmark_source=payload.benchmark_source,
+    )
+
+
+def _build_masked_text_page_b64(image_bytes: bytes, regions: list[OCRRegionInput]) -> str:
+    from PIL import Image
+
+    with Image.open(io.BytesIO(image_bytes)) as source:
+        buffer = io.BytesIO()
+        source.convert("RGB").save(buffer, format="PNG")
+    return base64.b64encode(buffer.getvalue()).decode("ascii")
+
+
+def _glm_region_bbox(region: OCRRegionInput) -> tuple[float, float, float, float] | None:
+    if region.bbox_xyxy and len(region.bbox_xyxy) >= 4:
+        x1, y1, x2, y2 = [float(value) for value in region.bbox_xyxy[:4]]
+        return (x1, y1, x2, y2)
+    if region.polygon:
+        xs = [float(point[0]) for point in region.polygon]
+        ys = [float(point[1]) for point in region.polygon]
+        if xs and ys:
+            return (min(xs), min(ys), max(xs), max(ys))
+    return None
+
+
+def _group_regions_for_glm_blocks(regions: list[OCRRegionInput]) -> list[list[OCRRegionInput]]:
+    annotated: list[tuple[int, float, float, float, float, OCRRegionInput]] = []
+    for index, region in enumerate(regions):
+        bbox = _glm_region_bbox(region)
+        if bbox is None:
+            continue
+        order = int(region.reading_order if region.reading_order is not None else index)
+        annotated.append((order, bbox[0], bbox[1], bbox[2], bbox[3], region))
+    if not annotated:
+        return []
+
+    groups: list[dict[str, Any]] = []
+    for row in sorted(annotated, key=lambda item: (item[1], item[0])):
+        _order, x1, _y1, x2, _y2, region = row
+        center_x = (x1 + x2) / 2.0
+        matched: dict[str, Any] | None = None
+        best_score = (-1.0, -1.0)
+        for group in groups:
+            overlap = max(0.0, min(x2, group["x2"]) - max(x1, group["x1"]))
+            contains = group["x1"] <= center_x <= group["x2"]
+            distance = abs(center_x - group["center_x"])
+            width_ref = max(1.0, x2 - x1, group["x2"] - group["x1"])
+            near = distance <= width_ref * 0.75
+            if not contains and overlap <= 0.0 and not near:
+                continue
+            score = (1.0 if contains else 0.0, overlap - distance * 0.01)
+            if score > best_score:
+                matched = group
+                best_score = score
+        if matched is None:
+            groups.append({"x1": x1, "x2": x2, "center_x": center_x, "regions": [region]})
+            continue
+        matched["x1"] = min(matched["x1"], x1)
+        matched["x2"] = max(matched["x2"], x2)
+        matched["center_x"] = (matched["x1"] + matched["x2"]) / 2.0
+        matched["regions"].append(region)
+
+    ordered_groups = sorted(groups, key=lambda item: item["x1"])
+    return [
+        sorted(
+            list(group["regions"]),
+            key=lambda region: (
+                int(region.reading_order if region.reading_order is not None else 10**9),
+                (_glm_region_bbox(region) or (0.0, 0.0, 0.0, 0.0))[1],
+                (_glm_region_bbox(region) or (0.0, 0.0, 0.0, 0.0))[0],
+            ),
+        )
+        for group in ordered_groups
+    ]
+
+
+def _build_glm_block_images(image_bytes: bytes, regions: list[OCRRegionInput]) -> list[dict[str, Any]]:
+    from PIL import Image
+
+    with Image.open(io.BytesIO(image_bytes)) as source:
+        base = source.convert("RGB")
+    width, height = base.size
+    region_groups = _group_regions_for_glm_blocks(regions)
+    if not region_groups:
+        return [{"region_id": "__glm_full_page__", "image_b64": _build_masked_text_page_b64(image_bytes, regions), "mode": "full_page"}]
+
+    blocks: list[dict[str, Any]] = []
+    for index, group in enumerate(region_groups):
+        boxes = [_glm_region_bbox(region) for region in group]
+        valid_boxes = [bbox for bbox in boxes if bbox is not None]
+        if not valid_boxes:
+            continue
+        x1 = min(bbox[0] for bbox in valid_boxes)
+        y1 = min(bbox[1] for bbox in valid_boxes)
+        x2 = max(bbox[2] for bbox in valid_boxes)
+        y2 = max(bbox[3] for bbox in valid_boxes)
+        box_w = max(1.0, x2 - x1)
+        box_h = max(1.0, y2 - y1)
+        pad_x = max(24, int(round(box_w * 0.05)))
+        pad_y = max(24, int(round(box_h * 0.08)))
+        crop_box = (
+            max(0, int(round(x1 - pad_x))),
+            max(0, int(round(y1 - pad_y))),
+            min(width, int(round(x2 + pad_x))),
+            min(height, int(round(y2 + pad_y))),
+        )
+        buffer = io.BytesIO()
+        base.crop(crop_box).save(buffer, format="PNG")
+        blocks.append(
+            {
+                "region_id": f"__glm_block_{index + 1}__",
+                "image_b64": base64.b64encode(buffer.getvalue()).decode("ascii"),
+                "mode": "column_block" if len(region_groups) > 1 else "page_block",
+                "bbox_xyxy": list(crop_box),
+            }
+        )
+    return blocks or [{"region_id": "__glm_full_page__", "image_b64": _build_masked_text_page_b64(image_bytes, regions), "mode": "full_page"}]
+
+
+def _run_glmocr_full_page_summary(
+    payload: SaiaFullPageExtractRequest,
+    image_bytes: bytes,
+    regions: list[OCRRegionInput],
+    *,
+    selected: bool,
+) -> OCRComparisonSummary:
+    from app.services.ocr_backends import GlmOcrBackend, OCRBackendError, OCRRecognitionMetadata
+
+    try:
+        backend = GlmOcrBackend()
+        block_results: list[Any] = []
+        warnings: list[str] = []
+        for block in _build_glm_block_images(image_bytes, regions):
+            result = backend.recognize(
+                block["image_b64"],
+                OCRRecognitionMetadata(
+                    page_id=payload.page_id,
+                    image_id=payload.image_id,
+                    region_id=str(block["region_id"]),
+                    label=str(block.get("mode") or "glm_block"),
+                    bbox_xyxy=list(block.get("bbox_xyxy") or []) or None,
+                    language_hint=payload.language_hint or (payload.metadata.language if payload.metadata else None),
+                    script_hint_seed=payload.script_hint_seed,
+                    year=payload.metadata.year if payload.metadata else None,
+                    place_or_origin=payload.metadata.place_or_origin if payload.metadata else None,
+                    script_family=payload.metadata.script_family if payload.metadata else None,
+                    document_type=payload.metadata.document_type if payload.metadata else None,
+                    notes=payload.metadata.notes if payload.metadata else None,
+                ),
+            )
+            block_results.append((block, result))
+        raw_text = "\n".join(str(result.text or "").strip() for _block, result in block_results if str(result.text or "").strip()).strip()
+        text_value = _strip_uncertainty_markers(raw_text)
+        lines_value = _strip_uncertainty_lines(text_value.splitlines())
+        text_value = "\n".join(lines_value).strip()
+        if not text_value:
+            warnings.append("EMPTY_TEXT")
+        if len(block_results) > 1:
+            warnings.append(f"GLM_BLOCKS:{len(block_results)}")
+        notes = ["experimental document-level OCR; using original page/column crops rather than line crops"]
+        for block, _result in block_results:
+            notes.append(f"{block['region_id']}:{block['mode']}")
+        return OCRComparisonSummary(
+            backend_name="glmocr",
+            model_name="GLM-OCR-0.9B",
+            selected=selected,
+            text=text_value,
+            lines=lines_value,
+            confidence=None,
+            warnings=warnings,
+            language_hint=payload.language_hint or (payload.metadata.language if payload.metadata else None),
+            script_family=payload.metadata.script_family if payload.metadata else None,
+            notes=notes,
+        )
+    except OCRBackendError as exc:
+        return OCRComparisonSummary(
+            backend_name="glmocr",
+            model_name="GLM-OCR-0.9B",
+            selected=selected,
+            text="",
+            lines=[],
+            confidence=0.0,
+            warnings=[str(exc)],
+            language_hint=payload.language_hint or (payload.metadata.language if payload.metadata else None),
+            script_family=payload.metadata.script_family if payload.metadata else None,
+            notes=["experimental document-level OCR"],
+        )
+
+
+def _full_page_response_from_comparison_summary(
+    summary: OCRComparisonSummary,
+    payload: SaiaFullPageExtractRequest,
+) -> SaiaFullPageExtractResponse:
+    text_value = str(summary.text or "").strip()
+    lines_value = [line for line in summary.lines if str(line or "").strip()]
+    if not text_value and lines_value:
+        text_value = "\n".join(lines_value).strip()
+    detected_language, language_confidence = _detect_language_metadata(text_value)
+    if detected_language == "unknown" and payload.language_hint:
+        detected_language = _normalize_detected_language(str(payload.language_hint))
+    return SaiaFullPageExtractResponse(
+        status=_resolve_full_page_status(text=text_value, confidence=summary.confidence, warnings=list(summary.warnings)),  # type: ignore[arg-type]
+        model_used=summary.model_name,
+        fallbacks_used=[],
+        detected_language=_normalize_detected_language(detected_language),
+        language_confidence=language_confidence,
+        script_hint=_map_extract_script_hint_to_full_page(payload.script_hint_seed),  # type: ignore[arg-type]
+        confidence=summary.confidence,
+        warnings=list(summary.warnings),
+        lines=lines_value,
+        text=text_value,
+        fallbacks=[],
+        comparison_runs=[summary],
+    )
+
+
+def _build_comparison_runs(result: OCRExtractResponse, requested_backend: str) -> list[OCRComparisonSummary]:
+    order_map = {
+        region.region_id: int(region.reading_order if region.reading_order is not None else index)
+        for index, region in enumerate(result.regions)
+    }
+    selected_text = str(result.final_text or result.text or "").strip()
+    selected_lines = [line for line in selected_text.splitlines() if line.strip()]
+    selected_confidence = None
+    if result.raw_ocr is not None:
+        selected_confidence = float(result.raw_ocr.confidence)
+    selected_meta = result.regions[0].raw_metadata if result.regions and result.regions[0].raw_metadata else {}
+
+    runs: list[OCRComparisonSummary] = [
+        OCRComparisonSummary(
+            backend_name="kraken_family" if requested_backend == "auto" and str(result.ocr_backend or "").startswith("kraken") else str(result.ocr_backend or requested_backend or "selected"),
+            model_name=result.model,
+            selected=True,
+            text=selected_text,
+            lines=selected_lines,
+            confidence=selected_confidence,
+            warnings=list(result.warnings),
+            language_hint=str(selected_meta.get("normalized_language_hint") or selected_meta.get("language_hint") or "") or None,
+            script_family=str(selected_meta.get("script_family") or "") or None,
+            notes=[str(item) for item in list(selected_meta.get("notes") or []) if str(item).strip()],
+        )
+    ]
+
+    grouped: dict[tuple[str, str], list[Any]] = defaultdict(list)
+    for item in result.comparison_results:
+        if item.selected:
+            continue
+        grouped[(item.backend_name, item.model_name)].append(item)
+
+    for (backend_name, model_name), items in grouped.items():
+        ordered_items = sorted(items, key=lambda item: order_map.get(item.region_id, 10**9))
+        text_value = "\n".join(str(item.text or "").strip() for item in ordered_items if str(item.text or "").strip()).strip()
+        lines_value = [line for line in text_value.splitlines() if line.strip()]
+        warnings = [
+            str(item.raw_metadata.get("error"))
+            for item in ordered_items
+            if item.raw_metadata and item.raw_metadata.get("error")
+        ]
+        first_meta = next((item.raw_metadata for item in ordered_items if item.raw_metadata), {}) or {}
+        confidence_values = [float(item.confidence) for item in ordered_items if item.confidence is not None]
+        confidence = (sum(confidence_values) / len(confidence_values)) if confidence_values else None
+        runs.append(
+            OCRComparisonSummary(
+                backend_name=backend_name,
+                model_name=model_name,
+                selected=False,
+                text=text_value,
+                lines=lines_value,
+                confidence=confidence,
+                warnings=warnings,
+                language_hint=str(first_meta.get("normalized_language_hint") or first_meta.get("language_hint") or "") or None,
+                script_family=str(first_meta.get("script_family") or "") or None,
+                notes=[str(item) for item in list(first_meta.get("notes") or []) if str(item).strip()],
+            )
+        )
+    return runs
+
+
+def _full_page_response_from_extract(result: OCRExtractResponse) -> SaiaFullPageExtractResponse:
+    text_value = str(result.final_text or result.text or "")
+    text_value = _strip_uncertainty_markers(text_value)
+    lines_value = _strip_uncertainty_lines([line for line in text_value.splitlines() if line.strip()])
+    text_value = "\n".join(lines_value).strip()
+    detected_language, language_confidence = _detect_language_metadata(text_value)
+    confidence_value = None
+    if result.raw_ocr is not None:
+        confidence_value = float(result.raw_ocr.confidence)
+    elif result.regions:
+        region_conf = [float(region.confidence) for region in result.regions if region.confidence is not None]
+        confidence_value = (sum(region_conf) / len(region_conf)) if region_conf else None
+
+    warnings = list(dict.fromkeys(result.warnings))
+    return SaiaFullPageExtractResponse(
+        status=_resolve_full_page_status(text=text_value, confidence=confidence_value, warnings=warnings),  # type: ignore[arg-type]
+        model_used=result.model,
+        fallbacks_used=list(result.fallbacksUsed),
+        detected_language=_normalize_detected_language(detected_language),
+        language_confidence=language_confidence,
+        script_hint=_map_extract_script_hint_to_full_page(result.script_hint),  # type: ignore[arg-type]
+        confidence=confidence_value,
+        warnings=warnings,
+        lines=lines_value,
+        text=text_value,
+        fallbacks=[],
+        comparison_runs=[],
+    )
+
+
+async def _run_segmented_trace_pipeline(
+    *,
+    run_id: str,
+    asset_ref: str,
+    payload: SaiaFullPageExtractRequest,
+    extract_payload: OCRExtractRequest,
+) -> dict[str, Any]:
+    log_event(run_id, "OCR_RUNNING", "START", f"Segmented OCR on {len(extract_payload.regions or [])} regions.")
+    update_run_fields(run_id, status="RUNNING", current_stage="OCR_RUNNING")
+
+    ocr_response_any = await asyncio.to_thread(_get_ocr_agent().run, extract_payload)
+    if not isinstance(ocr_response_any, OCRExtractResponse):
+        raise OCRAgentError("Segmented OCR did not return a full OCR response.")
+    ocr_response = ocr_response_any
+
+    raw_ocr = ocr_response.raw_ocr
+    raw_text = str(raw_ocr.text if raw_ocr is not None else ocr_response.text or "")
+    raw_lines = list(raw_ocr.lines) if raw_ocr is not None else [line for line in raw_text.splitlines() if line.strip()]
+    confidence_value = float(raw_ocr.confidence) if raw_ocr is not None else 0.0
+    detected_language, _detected_confidence = _detect_language_metadata(raw_text or str(ocr_response.final_text or ""))
+    if detected_language == "unknown" and payload.language_hint:
+        detected_language = _normalize_detected_language(str(payload.language_hint))
+
+    ocr_payload: dict[str, Any] = {
+        "lines": raw_lines,
+        "text": raw_text,
+        "script_hint": str(raw_ocr.script_hint if raw_ocr is not None else ocr_response.script_hint or "unknown"),
+        "detected_language": _normalize_detected_language(detected_language),
+        "confidence": confidence_value,
+        "warnings": list(dict.fromkeys(ocr_response.warnings)),
+        "quality_label": "OK",
+        "sanity_metrics": {},
+        "quality_label_v2": "OK",
+        "downstream_mode": decide_downstream_mode("OK"),
+    }
+
+    ocr_quality_report = compute_quality_report(raw_text, run_id=run_id, pass_idx=0)
+    hardened_quality_label = ocr_quality_report.quality_label
+    insert_ocr_quality_report(run_id, ocr_quality_report.to_dict())
+    _lex_lang = ocr_payload.get("detected_language", "unknown")
+    _lex_score = _lexical_plausibility(raw_text, _lex_lang) if _lex_lang != "unknown" else None
+    gate_decisions = enforce_quality_gates(ocr_quality_report, run_id=run_id, lexical_plausibility=_lex_score)
+    downstream_mode = gate_decisions["downstream_mode"]
+    effective_quality = build_effective_quality(ocr_quality_report, gate_decisions, confidence=confidence_value)
+
+    ocr_payload["quality_label"] = hardened_quality_label
+    ocr_payload["quality_label_v2"] = hardened_quality_label
+    ocr_payload["downstream_mode"] = downstream_mode
+
+    region_boxes = [
+        {
+            "region_id": region.region_id,
+            "bbox_xyxy": region.bbox_xyxy,
+            "polygon": region.polygon,
+            "backend_name": region.backend_name,
+            "model_name": region.model_name,
+        }
+        for region in ocr_response.regions
+    ]
+    text_sha256 = hashlib.sha256(raw_text.encode("utf-8")).hexdigest()
+    insert_ocr_attempt(
+        run_id,
+        {
+            "attempt_idx": 0,
+            "tiling_strategy": "segmented_units",
+            "tile_grid": None,
+            "overlap_pct": 0.0,
+            "tile_count": len(ocr_response.regions),
+            "tile_boxes_json": region_boxes,
+            "preproc_json": {
+                "ocr_backend": ocr_response.ocr_backend,
+                "compare_backends": [item.backend_name for item in ocr_response.comparison_results if not item.selected],
+            },
+            "model_used": ocr_response.model,
+            "text_sha256": text_sha256,
+            "text_hash": text_sha256[:16],
+            "quality_label": hardened_quality_label,
+            "effective_quality_json": effective_quality.to_dict(),
+            "gibberish_score": ocr_quality_report.gibberish_score,
+            "leading_fragment_ratio": ocr_quality_report.leading_fragment_ratio,
+            "seam_fragment_ratio": ocr_quality_report.seam_fragment_ratio,
+            "non_wordlike_frac": ocr_quality_report.non_wordlike_frac,
+            "char_entropy": ocr_quality_report.char_entropy,
+            "uncertainty_density": ocr_quality_report.uncertainty_density,
+            "cross_pass_stability": ocr_quality_report.cross_pass_stability,
+            "gates_passed": not bool(gate_decisions.get("blocked_stages")),
+            "noop_detected": False,
+            "decision": "PASS" if not bool(gate_decisions.get("blocked_stages")) else "FAIL",
+            "ocr_text": raw_text[:2000] if raw_text else None,
+            "detail_json": {
+                "ocr_backend": ocr_response.ocr_backend,
+                "regions": len(ocr_response.regions),
+                "comparison_results": len(ocr_response.comparison_results),
+                "downstream_mode": downstream_mode,
+                "blocked_stages": gate_decisions.get("blocked_stages", []),
+            },
+        },
+    )
+
+    if ocr_response.comparison_results:
+        insert_ocr_backend_results(
+            run_id,
+            [
+                {
+                    "page_id": item.page_id,
+                    "region_id": item.region_id,
+                    "backend_name": item.backend_name,
+                    "model_name": item.model_name,
+                    "confidence": item.confidence,
+                    "selected": item.selected,
+                    "text": item.text,
+                    "raw_json": item.raw_metadata,
+                }
+                for item in ocr_response.comparison_results
+            ],
+        )
+
+    update_run_fields(
+        run_id,
+        current_stage="OCR_DONE",
+        script_hint=ocr_payload["script_hint"],
+        detected_language=ocr_payload["detected_language"],
+        confidence=ocr_payload["confidence"],
+        warnings_json=json.dumps(
+            {
+                "warnings": ocr_payload["warnings"],
+                "quality_label": hardened_quality_label,
+                "quality_label_v2": hardened_quality_label,
+                "ocr_backend": ocr_response.ocr_backend,
+            },
+            ensure_ascii=False,
+        ),
+        ocr_lines_json=json.dumps(raw_lines, ensure_ascii=False),
+        ocr_text=raw_text,
+    )
+
+    if gate_decisions.get("blocked_stages"):
+        failure_reason = (
+            f"Quality gates FAILED for segmented OCR. quality_label_v2={hardened_quality_label}, "
+            f"blocked_stages={gate_decisions.get('blocked_stages', [])}, "
+            f"gibberish={ocr_quality_report.gibberish_score:.4f}, "
+            f"lead_frag={ocr_quality_report.leading_fragment_ratio:.4f}"
+        )
+        log_event(run_id, "QUALITY_BLOCKED", "ERROR", failure_reason)
+        update_run_fields(
+            run_id,
+            status="FAILED_QUALITY",
+            current_stage="QUALITY_BLOCKED",
+            error=failure_reason,
+            proofread_text=raw_text,
+        )
+        return {
+            "run_id": run_id,
+            "status": "FAILED_QUALITY",
+            "ocr_result": ocr_payload,
+            "proofread_text": None,
+            "detected_language": ocr_payload["detected_language"],
+            "final_confidence": ocr_payload["confidence"],
+            "quality_label": hardened_quality_label,
+            "quality_label_v2": hardened_quality_label,
+            "effective_quality": effective_quality.to_dict(),
+            "downstream_mode": downstream_mode,
+            "sanity_metrics": {},
+            "quality_gates": gate_decisions,
+            "ocr_attempts": list_ocr_attempts(run_id),
+            "failure_reason": failure_reason,
+            "chunks_count": 0,
+            "mentions_count": 0,
+            "top_mentions": [],
+            "mention_report": None,
+            "mention_recall": None,
+            "linking_result": None,
+            "consolidated_report": None,
+            "ocr_backend_results": [item.model_dump() for item in ocr_response.comparison_results],
+        }
+
+    proofread_text = str(ocr_response.final_text or raw_text or "").strip() or raw_text
+    log_event(run_id, "PROOFREAD_DONE", "END", "Segmented OCR proofread complete.")
+
+    final_pipeline_text = proofread_text or raw_text
+    if final_pipeline_text and final_pipeline_text != raw_text:
+        post_proof_report = compute_quality_report(
+            final_pipeline_text,
+            run_id=run_id,
+            pass_idx=10,
+            previous_pass_tokens=[t for t in raw_text.split() if t],
+        )
+        hardened_quality_label = post_proof_report.quality_label
+        insert_ocr_quality_report(run_id, post_proof_report.to_dict())
+        _pp_lex_lang = ocr_payload.get("detected_language", "unknown")
+        _pp_lex_score = _lexical_plausibility(final_pipeline_text, _pp_lex_lang) if _pp_lex_lang != "unknown" else None
+        gate_decisions = enforce_quality_gates(post_proof_report, run_id=run_id, lexical_plausibility=_pp_lex_score)
+        downstream_mode = gate_decisions["downstream_mode"]
+        effective_quality = build_effective_quality(post_proof_report, gate_decisions, confidence=ocr_payload["confidence"])
+        ocr_payload["quality_label"] = hardened_quality_label
+        ocr_payload["quality_label_v2"] = hardened_quality_label
+        ocr_payload["downstream_mode"] = downstream_mode
+        ocr_quality_report = post_proof_report
+
+    update_run_fields(
+        run_id,
+        current_stage="PROOFREAD_DONE",
+        proofread_text=proofread_text,
+        confidence=ocr_payload["confidence"],
+        warnings_json=json.dumps(
+            {
+                "warnings": ocr_payload["warnings"],
+                "quality_label": ocr_payload["quality_label"],
+                "quality_label_v2": ocr_payload["quality_label_v2"],
+                "ocr_backend": ocr_response.ocr_backend,
+            },
+            ensure_ascii=False,
+        ),
+    )
+
+    if not gate_decisions.get("ner_allowed", True):
+        log_event(run_id, "ANALYZE_SKIPPED", "INFO", f"NER/analysis SKIPPED: ner_allowed=False (quality={hardened_quality_label})")
+        update_run_fields(run_id, current_stage="ANALYZE_SKIPPED")
+        chunks: list[dict[str, Any]] = []
+        mentions: list[dict[str, Any]] = []
+        salvage_debug: dict[str, Any] = {"skipped": True, "reason": "ner_not_allowed"}
+        chunks_count = 0
+        mentions_count = 0
+    else:
+        log_event(run_id, "ANALYZE_RUNNING", "START", "Running chunk/entity analysis.")
+        update_run_fields(run_id, current_stage="ANALYZE_RUNNING")
+        base_text_source = "proofread" if proofread_text.strip() else "ocr"
+        base_text = proofread_text if base_text_source == "proofread" else raw_text
+        chunks, mentions, _candidates, salvage_debug = _run_trace_analysis(run_id, base_text)
+        chunks_count = len(chunks)
+        mentions_count = len(mentions)
+
+        mention_recall_result = check_mention_recall(base_text, mentions_count, hardened_quality_label)
+        if not mention_recall_result["mention_recall_ok"]:
+            ocr_payload["warnings"] = list(dict.fromkeys([*ocr_payload["warnings"], mention_recall_result["reason"]]))
+            log_event(run_id, "QUALITY_GATES", "INFO", mention_recall_result["reason"])
+
+        if mention_recall_result.get("trigger_high_recall"):
+            hr_mentions = extract_high_recall_mentions(
+                base_text,
+                script=ocr_quality_report.script_family,
+                quality_label=hardened_quality_label,
+            )
+            if hr_mentions:
+                existing_spans = {(m.get("start_offset"), m.get("end_offset")) for m in mentions}
+                new_hr = [m for m in hr_mentions if (m.get("start_offset"), m.get("end_offset")) not in existing_spans]
+                if new_hr:
+                    for mention in new_hr:
+                        mention["chunk_id"] = _assign_chunk_id_for_span(
+                            int(mention.get("start_offset", 0)),
+                            int(mention.get("end_offset", 0)),
+                            chunks,
+                        )
+                    new_rows = insert_entity_mentions(run_id, new_hr)
+                    mentions.extend(new_rows)
+                    mentions_count = len(mentions)
+                    log_event(run_id, "ANALYZE_RUNNING", "INFO", f"High-recall extraction added {len(new_rows)} mentions.")
+                    salvage_debug["high_recall_added"] = len(new_rows)
+
+        update_run_fields(
+            run_id,
+            current_stage="ANALYZE_DONE",
+            base_text_source=base_text_source,
+            chunks_count=chunks_count,
+            mentions_count=mentions_count,
+        )
+        log_event(run_id, "ANALYZE_DONE", "END", f"chunks={chunks_count}, mentions={mentions_count}")
+
+    mention_report = _build_mention_extraction_report(run_id, asset_ref, mentions, salvage_debug) if mentions or not salvage_debug.get("skipped") else None
+    if gate_decisions.get("ner_allowed", True):
+        base_text = proofread_text.strip() or raw_text
+        mention_recall = check_mention_recall(base_text, mentions_count, hardened_quality_label)
+    else:
+        mention_recall = {
+            "mention_recall_ok": True,
+            "reason": "NER skipped (ner_allowed=False)",
+            "trigger_high_recall": False,
+        }
+
+    log_event(run_id, "STORED", "END", "Run results persisted in SQLite.")
+    update_run_fields(run_id, current_stage="STORED", proofread_text=proofread_text)
+
+    if not gate_decisions.get("token_search_allowed", True):
+        log_event(run_id, "LINKING_SKIPPED", "INFO", f"Authority linking SKIPPED: token_search_allowed=False (quality={hardened_quality_label})")
+        linking_result = None
+    else:
+        linking_result = _run_authority_linking_stage(run_id)
+
+    consolidated_report = _build_consolidated_report(run_id, asset_ref, mentions, salvage_debug, linking_result) if mentions or linking_result else None
+
+    if not gate_decisions.get("token_search_allowed", True):
+        log_event(run_id, "INDEX_SKIPPED", "INFO", f"RAG auto-index SKIPPED: token_search_allowed=False (quality={hardened_quality_label})")
+    else:
+        _auto_index_run(run_id)
+
+    log_event(run_id, "DONE", "END", "Pipeline completed successfully.")
+    update_run_fields(run_id, status="COMPLETED", current_stage="DONE", error=None)
+
+    return {
+        "run_id": run_id,
+        "status": "COMPLETED",
+        "ocr_result": ocr_payload,
+        "proofread_text": proofread_text,
+        "detected_language": ocr_payload["detected_language"],
+        "final_confidence": ocr_payload["confidence"],
+        "quality_label": hardened_quality_label,
+        "quality_label_v2": hardened_quality_label,
+        "effective_quality": effective_quality.to_dict(),
+        "downstream_mode": downstream_mode,
+        "sanity_metrics": {},
+        "quality_gates": gate_decisions,
+        "ocr_attempts": list_ocr_attempts(run_id),
+        "mention_recall": mention_recall,
+        "chunks_count": chunks_count,
+        "mentions_count": mentions_count,
+        "top_mentions": mentions[:20],
+        "mention_report": mention_report,
+        "linking_result": linking_result,
+        "consolidated_report": consolidated_report,
+        "ocr_backend_results": [item.model_dump() for item in ocr_response.comparison_results],
+    }
+
+
 @router.post("/ocr/extract", response_model=OCRExtractAnyResponse)
 async def ocr_extract(
     payload: OCRExtractRequest,
@@ -2227,110 +3138,113 @@ async def ocr_saia(payload: SaiaOCRRequest) -> SaiaOCRResponse:
 @router.post("/ocr/extract_full_page", response_model=SaiaFullPageExtractResponse)
 async def ocr_extract_full_page(payload: SaiaFullPageExtractRequest) -> SaiaFullPageExtractResponse:
     base_warnings: list[str] = []
+    requested_backend = str(payload.ocr_backend or "auto").strip().lower()
+    if requested_backend == "saia":
+        requested_backend = "auto"
+    effective_payload = payload.model_copy(
+        update={
+            "ocr_backend": requested_backend,
+            "compare_backends": [backend for backend in payload.compare_backends if backend != "saia"],
+        }
+    )
 
     try:
-        image_bytes = decode_image_bytes(payload.image_b64 or "")
+        image_bytes = decode_image_bytes(effective_payload.image_b64 or "")
     except Exception as exc:
         raise HTTPException(status_code=422, detail=f"Invalid image_b64 payload: {exc}") from exc
 
-    location_suggestions = list(payload.location_suggestions)
-    if not location_suggestions:
+    location_suggestions = list(effective_payload.location_suggestions)
+    regions = list(effective_payload.regions)
+    if not location_suggestions and not regions:
         try:
-            location_suggestions = await asyncio.to_thread(_run_segmentation_for_suggestions, image_bytes)
+            detected_regions = await asyncio.to_thread(_run_segmentation_for_regions, image_bytes)
+            location_suggestions = _extract_location_suggestions(
+                {
+                    "annotations": [
+                        {"id": region.region_id, "bbox": [region.bbox_xyxy[0], region.bbox_xyxy[1], region.bbox_xyxy[2] - region.bbox_xyxy[0], region.bbox_xyxy[3] - region.bbox_xyxy[1]], "category_id": idx + 1}
+                        for idx, region in enumerate(detected_regions)
+                        if region.bbox_xyxy is not None
+                    ],
+                    "categories": [{"id": idx + 1, "name": region.label or "Main script black"} for idx, region in enumerate(detected_regions)],
+                }
+            )
+            regions = detected_regions
         except Exception as exc:
             base_warnings.append(f"SEGMENTATION_FAILED:{exc}")
+    elif not regions and location_suggestions:
+        regions = _regions_from_location_suggestions(location_suggestions)
+
+    if not regions:
+        return SaiaFullPageExtractResponse(
+            status="EMPTY",
+            model_used=requested_backend if requested_backend != "auto" else "kraken_auto",
+            fallbacks_used=[],
+            detected_language=_normalize_detected_language(str(effective_payload.language_hint or "unknown")),
+            language_confidence=None,
+            script_hint=_map_extract_script_hint_to_full_page(effective_payload.script_hint_seed),  # type: ignore[arg-type]
+            confidence=0.0,
+            warnings=base_warnings,
+            lines=[],
+            text="",
+            fallbacks=[],
+            comparison_runs=[],
+        )
+
+    glm_requested = requested_backend == "glmocr"
+    glm_compare_requested = "glmocr" in effective_payload.compare_backends
+    structured_compare_backends = [backend for backend in effective_payload.compare_backends if backend != "glmocr"]
+
+    if glm_requested:
+        return _full_page_response_from_comparison_summary(
+            _run_glmocr_full_page_summary(effective_payload, image_bytes, regions, selected=True),
+            effective_payload,
+        )
 
     try:
-        ocr_result = await asyncio.to_thread(
-            _get_saia_ocr_agent().extract,
-            SaiaOCRRequest(
-                image_id=payload.image_id,
-                page_id=payload.page_id,
-                image_b64=payload.image_b64,
-                script_hint_seed=payload.script_hint_seed,
-                apply_proofread=payload.apply_proofread,
-                location_suggestions=location_suggestions,
+        extract_result_any = await asyncio.to_thread(
+            _get_ocr_agent().run,
+            _build_segmented_extract_request(
+                effective_payload.model_copy(
+                    update={
+                        "regions": regions,
+                        "location_suggestions": location_suggestions,
+                        "compare_backends": structured_compare_backends,
+                    }
+                ),
+                regions,
             ),
         )
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     except SaiaConfigError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
-    except SaiaOCRAgentError as exc:
+    except OCRAgentError as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
     except Exception as exc:  # pragma: no cover
         raise HTTPException(status_code=500, detail=f"Full-page OCR failed: {exc}") from exc
 
-    warnings = list(dict.fromkeys([*base_warnings, *ocr_result.warnings]))
-    fallbacks_used = list(dict.fromkeys(ocr_result.fallbacks_used or [item.model for item in ocr_result.fallbacks]))
-
-    detected_language = _normalize_detected_language(ocr_result.detected_language)
-    local_language, local_confidence = _detect_language_metadata(ocr_result.text)
-    local_language = _normalize_detected_language(local_language)
-    confidence_value = float(ocr_result.confidence) if ocr_result.confidence is not None else None
-    language_confidence: float | None = confidence_value
-    text_value = str(ocr_result.text or "")
-    french_family_guess = _resolve_french_family_language(text_value)
-
-    if not text_value.strip():
-        detected_language = "unknown"
-        language_confidence = None
-    else:
-        if detected_language == "unknown":
-            if local_language != "unknown":
-                detected_language = local_language
-                language_confidence = local_confidence
-            elif french_family_guess is not None:
-                detected_language = french_family_guess
-                language_confidence = 0.58
-        elif local_language == detected_language and local_confidence is not None:
-            baseline = language_confidence if language_confidence is not None else local_confidence
-            language_confidence = min(1.0, max(baseline, local_confidence) + 0.06)
-        else:
-            if (
-                french_family_guess is not None
-                and detected_language in {"latin", "unknown", "french"}
-                and not (
-                    detected_language in {"old_french", "middle_french", "anglo_norman"}
-                    and local_language == detected_language
-                )
-            ):
-                detected_language = french_family_guess
-                if _is_french_family_language(local_language) and local_confidence is not None:
-                    language_confidence = min(0.75, max(local_confidence, language_confidence or 0.0))
-                else:
-                    language_confidence = min(0.70, max(language_confidence or 0.0, 0.58))
-            elif (
-                detected_language == "latin"
-                and _is_french_family_language(local_language)
-                and local_confidence is not None
-                and local_confidence >= 0.55
-            ):
-                detected_language = "middle_french" if local_language == "french" else local_language
-                language_confidence = min(0.75, max(0.55, local_confidence))
-
-        if detected_language == "unknown":
-            detected_language = _fallback_detected_language(ocr_result.script_hint, text_value)
-            if detected_language != "unknown" and language_confidence is None:
-                language_confidence = 0.55 if _is_french_family_language(detected_language) else 0.45
-
-    if language_confidence is not None:
-        language_confidence = max(0.0, min(1.0, float(language_confidence)))
-    status = _resolve_full_page_status(text=ocr_result.text, confidence=confidence_value, warnings=warnings)
-
-    return SaiaFullPageExtractResponse(
-        status=status,  # type: ignore[arg-type]
-        model_used=ocr_result.model_used,
-        fallbacks_used=fallbacks_used,
-        detected_language=detected_language,
-        language_confidence=language_confidence,
-        script_hint=ocr_result.script_hint,
-        confidence=confidence_value,
-        warnings=warnings,
-        lines=list(ocr_result.lines),
-        text=ocr_result.text,
-        fallbacks=list(ocr_result.fallbacks),
-    )
+    if not isinstance(extract_result_any, OCRExtractResponse):
+        raise HTTPException(status_code=500, detail="Unexpected segmented OCR response.")
+    structured_response = _full_page_response_from_extract(extract_result_any)
+    comparison_runs = _build_comparison_runs(extract_result_any, requested_backend)
+    if glm_compare_requested:
+        comparison_runs.append(
+            _run_glmocr_full_page_summary(effective_payload, image_bytes, regions, selected=False)
+        )
+    structured_response = structured_response.model_copy(update={"comparison_runs": comparison_runs})
+    if base_warnings:
+        merged_warnings = list(dict.fromkeys([*base_warnings, *structured_response.warnings]))
+        structured_response = structured_response.model_copy(
+            update={
+                "warnings": merged_warnings,
+                "status": _resolve_full_page_status(
+                    text=structured_response.text,
+                    confidence=structured_response.confidence,
+                    warnings=merged_warnings,
+                ),
+            }
+        )
+    return structured_response
 
 
 # ── Quality label ranking helper ──────────────────────────────────────
@@ -2381,6 +3295,14 @@ async def ocr_page_with_trace(payload: SaiaFullPageExtractRequest) -> dict[str, 
     asset_sha256 = hashlib.sha256(image_bytes).hexdigest()
     run_id = create_run(asset_ref=asset_ref, asset_sha256=asset_sha256)
     log_event(run_id, "RECEIVED", "START", "OCR trace run received.")
+    if str(payload.benchmark_text or "").strip():
+        insert_ocr_benchmark_reference(
+            run_id,
+            page_id=payload.page_id,
+            source_label=str(payload.benchmark_source or "reference").strip() or "reference",
+            reference_text=str(payload.benchmark_text),
+        )
+        log_event(run_id, "RECEIVED", "INFO", "Stored benchmark/reference text for later OCR comparison.")
 
     location_suggestions = list(payload.location_suggestions)
     base_warnings: list[str] = []
@@ -2395,6 +3317,30 @@ async def ocr_page_with_trace(payload: SaiaFullPageExtractRequest) -> dict[str, 
     else:
         log_event(run_id, "RECEIVED", "INFO",
                   f"Using provided location suggestions: {len(location_suggestions)}")
+
+    structured_regions = list(payload.regions) or _regions_from_location_suggestions(location_suggestions)
+    if not structured_regions and not payload.location_suggestions:
+        try:
+            structured_regions = await asyncio.to_thread(_run_segmentation_for_regions, image_bytes)
+            if structured_regions:
+                log_event(run_id, "RECEIVED", "INFO", f"Segmented OCR regions prepared: {len(structured_regions)}")
+        except Exception as exc:
+            base_warnings.append(f"SEGMENTATION_REGIONS_FAILED:{exc}")
+            log_event(run_id, "RECEIVED", "WARN", f"Structured region preparation failed: {exc}")
+
+    if structured_regions:
+        try:
+            return await _run_segmented_trace_pipeline(
+                run_id=run_id,
+                asset_ref=asset_ref,
+                payload=payload,
+                extract_payload=_build_segmented_extract_request(payload, structured_regions),
+            )
+        except Exception as exc:
+            err = str(exc)
+            update_run_fields(run_id, status="FAILED", current_stage="FAILED", error=err)
+            log_event(run_id, "FAILED", "ERROR", err)
+            raise HTTPException(status_code=500, detail={"run_id": run_id, "error": err}) from exc
 
     try:
         # ══════════════════════════════════════════════════════════════
@@ -3223,6 +4169,7 @@ async def ocr_trace_tables(run_id: str) -> dict[str, Any]:
         "tables": [
             table_view_for_run(run_id),
             table_view_for_events(run_id),
+            table_view_for_ocr_backend_results(run_id),
             table_view_for_chunks(run_id),
             table_view_for_entity_mentions(run_id),
             table_view_for_entity_candidates(run_id),

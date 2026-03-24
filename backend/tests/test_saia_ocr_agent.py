@@ -73,7 +73,7 @@ def _png_b64(width: int, height: int) -> str:
 
 
 def test_prompt_declares_json_schema_and_strict_rules() -> None:
-    assert "keys must be exactly: lines, text, script_hint, detected_language, confidence, warnings." in SAIA_OCR_USER_PROMPT
+    assert "Keys must be exactly: lines, text, script_hint, detected_language, confidence, warnings." in SAIA_OCR_USER_PROMPT
     assert "If nothing readable is visible, return lines=[] and text=\"\"." in SAIA_OCR_USER_PROMPT
 
 
@@ -110,13 +110,13 @@ def test_build_messages_includes_location_suggestions_as_text_only() -> None:
 
 def test_json_repair_retry_on_same_model() -> None:
     fake = _FakeSaiaClient(
-        models=["internvl3.5-30b-a3b"],
-        responses_by_model={"internvl3.5-30b-a3b": ["not-json", _valid_json()]},
+        models=["qwen3-vl-30b-a3b-instruct"],
+        responses_by_model={"qwen3-vl-30b-a3b-instruct": ["not-json", _valid_json()]},
     )
-    agent = SaiaOCRAgent(client=fake, model_prefs=["internvl3.5-30b-a3b"])
+    agent = SaiaOCRAgent(client=fake, model_prefs=["qwen3-vl-30b-a3b-instruct"])
     result = agent.extract(SaiaOCRRequest(image_b64=SAMPLE_B64, apply_proofread=False))
 
-    assert result.model_used == "internvl3.5-30b-a3b"
+    assert result.model_used == "qwen3-vl-30b-a3b-instruct"
     assert result.text == "Linea una"
     assert result.detected_language == "latin"
     assert len(fake.calls) == 2
@@ -128,13 +128,13 @@ def test_json_repair_retry_on_same_model() -> None:
 
 def test_model_fallback_when_first_model_not_found() -> None:
     fake = _FakeSaiaClient(
-        models=["internvl2.5-8b-mpo", "internvl3.5-30b-a3b"],
+        models=["qwen3-vl-30b-a3b-instruct", "internvl3.5-30b-a3b"],
         responses_by_model={"internvl3.5-30b-a3b": [_valid_json("Linea secunda")]},
-        failures_by_model={"internvl2.5-8b-mpo": RuntimeError("404 model not found")},
+        failures_by_model={"qwen3-vl-30b-a3b-instruct": RuntimeError("404 model not found")},
     )
     agent = SaiaOCRAgent(
         client=fake,
-        model_prefs=["internvl2.5-8b-mpo", "internvl3.5-30b-a3b"],
+        model_prefs=["qwen3-vl-30b-a3b-instruct", "internvl3.5-30b-a3b"],
     )
     result = agent.extract(SaiaOCRRequest(image_b64=SAMPLE_B64, apply_proofread=False))
 
@@ -142,7 +142,42 @@ def test_model_fallback_when_first_model_not_found() -> None:
     assert result.text == "Linea secunda"
     assert result.detected_language == "latin"
     assert len(result.fallbacks) == 1
-    assert result.fallbacks[0].model == "internvl2.5-8b-mpo"
+    assert result.fallbacks[0].model == "qwen3-vl-30b-a3b-instruct"
+
+
+def test_model_preference_honors_qwen_first() -> None:
+    fake = _FakeSaiaClient(
+        models=["qwen3-vl-30b-a3b-instruct", "internvl3.5-30b-a3b"],
+        responses_by_model={"qwen3-vl-30b-a3b-instruct": [_valid_json("Linea qwen")]},
+    )
+    agent = SaiaOCRAgent(
+        client=fake,
+        model_prefs=["qwen3-vl-30b-a3b-instruct", "internvl3.5-30b-a3b"],
+    )
+
+    result = agent.extract(SaiaOCRRequest(image_b64=SAMPLE_B64, apply_proofread=False))
+
+    assert result.model_used == "qwen3-vl-30b-a3b-instruct"
+    assert fake.calls
+    assert fake.calls[0].get("model") == "qwen3-vl-30b-a3b-instruct"
+
+
+def test_fallback_when_preferred_model_not_in_probe_list(monkeypatch: Any) -> None:
+    fake = _FakeSaiaClient(
+        models=["internvl3.5-30b-a3b"],
+        responses_by_model={"internvl3.5-30b-a3b": [_valid_json("Linea fallback")]},
+    )
+    monkeypatch.setenv("SAIA_MODEL_PROBE", "1")
+    agent = SaiaOCRAgent(
+        client=fake,
+        model_prefs=["qwen3-vl-30b-a3b-instruct", "internvl3.5-30b-a3b"],
+    )
+
+    result = agent.extract(SaiaOCRRequest(image_b64=SAMPLE_B64, apply_proofread=False))
+
+    assert result.model_used == "internvl3.5-30b-a3b"
+    assert fake.calls
+    assert fake.calls[0].get("model") == "internvl3.5-30b-a3b"
 
 
 def test_invalid_detected_language_is_coerced_to_unknown() -> None:
@@ -193,17 +228,17 @@ def test_saia_api_key_is_read_from_env(monkeypatch: Any) -> None:
 
 def test_extract_auto_resizes_image_before_call(monkeypatch: Any) -> None:
     fake = _FakeSaiaClient(
-        models=["internvl3.5-30b-a3b"],
-        responses_by_model={"internvl3.5-30b-a3b": [_valid_json("Linea una")]},
+        models=["qwen3-vl-30b-a3b-instruct"],
+        responses_by_model={"qwen3-vl-30b-a3b-instruct": [_valid_json("Linea una")]},
     )
     monkeypatch.setattr("app.agents.saia_ocr_agent.SAIA_OCR_MAX_PIXELS", 50)
     monkeypatch.setattr("app.agents.saia_ocr_agent.SAIA_OCR_MAX_LONG_EDGE", 20)
 
     original = _png_b64(30, 30)
-    agent = SaiaOCRAgent(client=fake, model_prefs=["internvl3.5-30b-a3b"])
+    agent = SaiaOCRAgent(client=fake, model_prefs=["qwen3-vl-30b-a3b-instruct"])
     result = agent.extract(SaiaOCRRequest(image_b64=original, apply_proofread=False))
 
-    assert result.model_used == "internvl3.5-30b-a3b"
+    assert result.model_used == "qwen3-vl-30b-a3b-instruct"
     assert any(item.startswith("AUTO_RESIZED_FOR_LIMIT:") for item in result.warnings)
 
     call_messages = fake.calls[0]["messages"]
@@ -214,25 +249,42 @@ def test_extract_auto_resizes_image_before_call(monkeypatch: Any) -> None:
 
 def test_fail_all_models_include_model_error_details() -> None:
     fake = _FakeSaiaClient(
-        models=["internvl3.5-30b-a3b"],
-        failures_by_model={"internvl3.5-30b-a3b": RuntimeError("simulated upstream failure")},
+        models=["qwen3-vl-30b-a3b-instruct"],
+        failures_by_model={"qwen3-vl-30b-a3b-instruct": RuntimeError("simulated upstream failure")},
     )
-    agent = SaiaOCRAgent(client=fake, model_prefs=["internvl3.5-30b-a3b"])
+    agent = SaiaOCRAgent(client=fake, model_prefs=["qwen3-vl-30b-a3b-instruct"])
     result = agent.extract(SaiaOCRRequest(image_b64=SAMPLE_B64, apply_proofread=False))
 
     assert result.status == "FAIL"
     assert "OCR_FAILED_ALL_MODELS" in result.warnings
-    assert any(item.startswith("MODEL_ERROR:internvl3.5-30b-a3b:") for item in result.warnings)
+    assert any(item.startswith("MODEL_ERROR:qwen3-vl-30b-a3b-instruct:") for item in result.warnings)
 
 
-def test_non_internvl_models_are_ignored() -> None:
+def test_non_internvl_models_are_allowed_for_ocr() -> None:
     fake = _FakeSaiaClient(
         models=["qwen3-vl-30b-a3b-instruct", "internvl3.5-30b-a3b"],
-        responses_by_model={"internvl3.5-30b-a3b": [_valid_json("Linea tertia")]},
+        responses_by_model={"qwen3-vl-30b-a3b-instruct": [_valid_json("Linea tertia")]},
     )
     agent = SaiaOCRAgent(client=fake, model_prefs=["qwen3-vl-30b-a3b-instruct", "internvl3.5-30b-a3b"])
     result = agent.extract(SaiaOCRRequest(image_b64=SAMPLE_B64, apply_proofread=False))
 
-    assert result.model_used == "internvl3.5-30b-a3b"
+    assert result.model_used == "qwen3-vl-30b-a3b-instruct"
     assert result.text == "Linea tertia"
-    assert all(call.get("model") == "internvl3.5-30b-a3b" for call in fake.calls)
+    assert fake.calls[0].get("model") == "qwen3-vl-30b-a3b-instruct"
+
+
+def test_ocr_payload_uses_deterministic_generation_params() -> None:
+    fake = _FakeSaiaClient(
+        models=["qwen3-vl-30b-a3b-instruct"],
+        responses_by_model={"qwen3-vl-30b-a3b-instruct": [_valid_json("Linea det")]},
+    )
+    agent = SaiaOCRAgent(client=fake, model_prefs=["qwen3-vl-30b-a3b-instruct"])
+
+    _ = agent.extract(SaiaOCRRequest(image_b64=SAMPLE_B64, apply_proofread=False))
+
+    assert fake.calls
+    call = fake.calls[0]
+    assert float(call.get("temperature", -1)) == 0.0
+    assert float(call.get("top_p", -1)) == 1.0
+    assert int(call.get("max_tokens", 0)) >= 4096
+    assert bool(call.get("deterministic")) is True
