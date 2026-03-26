@@ -263,6 +263,7 @@ class SaiaFullPageExtractRequest(BaseModel):
 class SaiaFullPageExtractResponse(BaseModel):
     status: Literal["FULL", "PARTIAL", "EMPTY"]
     model_used: str
+    run_id: str | None = None
     fallbacks_used: list[str] = Field(default_factory=list)
     detected_language: MANUSCRIPT_DETECTED_LANGUAGE = "unknown"
     language_confidence: float | None = None
@@ -271,6 +272,22 @@ class SaiaFullPageExtractResponse(BaseModel):
     warnings: list[str] = Field(default_factory=list)
     lines: list[str] = Field(default_factory=list)
     text: str = ""
+    original_image_size_bytes: int | None = None
+    original_image_width: int | None = None
+    original_image_height: int | None = None
+    processed_image_size_bytes: int | None = None
+    processed_image_width: int | None = None
+    processed_image_height: int | None = None
+    preprocessing_applied: bool | None = None
+    processed_variant_name: str | None = None
+    ocr_attempts_used: int | None = None
+    quality_label: str | None = None
+    downstream_mode: str | None = None
+    chunks_count: int | None = None
+    mentions_count: int | None = None
+    authority_report: str | None = None
+    mention_report: str | None = None
+    consolidated_report: str | None = None
     fallbacks: list[SaiaOCRFallback] = Field(default_factory=list)
     comparison_runs: list["OCRComparisonSummary"] = Field(default_factory=list)
 
@@ -289,24 +306,45 @@ class OCRComparisonSummary(BaseModel):
 
 
 class EvidenceSpanCreateRequest(BaseModel):
-    page_id: str
-    region_id: str
-    text: str
+    run_id: str | None = None
+    asset_ref: str | None = None
+    page_id: str | None = None
+    region_id: str | None = None
+    chunk_id: str | None = None
+    mention_id: str | None = None
+    text: str = ""
+    raw_text: str | None = None
+    normalized_text: str | None = None
+    start_offset: int | None = None
+    end_offset: int | None = None
     bbox_xyxy: list[float] | None = None
     polygon: list[list[float]] | None = None
-    model_used: str
-    prompt_version: str
-    crop_sha256: str
+    model_used: str | None = None
+    ocr_model: str | None = None
+    prompt_version: str | None = None
+    crop_sha256: str | None = None
+    meta_json: dict[str, Any] | None = None
 
 
 class EvidenceSpanRecord(BaseModel):
     span_id: str
-    page_id: str
-    region_id: str
+    run_id: str
+    asset_ref: str | None = None
+    page_id: str | None = None
+    region_id: str | None = None
+    chunk_id: str | None = None
+    mention_id: str | None = None
     text: str
+    raw_text: str
+    normalized_text: str | None = None
+    start_offset: int | None = None
+    end_offset: int | None = None
     bbox_xyxy: list[float] | None = None
     polygon: list[list[float]] | None = None
-    model_used: str
-    prompt_version: str
-    crop_sha256: str
+    model_used: str | None = None
+    ocr_model: str | None = None
+    prompt_version: str | None = None
+    crop_sha256: str | None = None
+    meta_json: dict[str, Any] | None = None
     created_at: str
+    updated_at: str | None = None

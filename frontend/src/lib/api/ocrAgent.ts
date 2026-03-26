@@ -61,6 +61,7 @@ export interface OCRFallback {
 export interface OCRExtractResponse {
   status: "FULL" | "PARTIAL" | "EMPTY";
   model_used: string;
+  run_id?: string | null;
   fallbacks_used: string[];
   detected_language: string;
   language_confidence: number | null;
@@ -69,12 +70,29 @@ export interface OCRExtractResponse {
   warnings: string[];
   lines: string[];
   text: string;
+  original_image_size_bytes?: number | null;
+  original_image_width?: number | null;
+  original_image_height?: number | null;
+  processed_image_size_bytes?: number | null;
+  processed_image_width?: number | null;
+  processed_image_height?: number | null;
+  preprocessing_applied?: boolean | null;
+  processed_variant_name?: string | null;
+  ocr_attempts_used?: number | null;
+  quality_label?: string | null;
+  downstream_mode?: string | null;
+  chunks_count?: number | null;
+  mentions_count?: number | null;
+  authority_report?: string | null;
+  mention_report?: string | null;
+  consolidated_report?: string | null;
   fallbacks?: OCRFallback[];
   comparison_runs?: OCRComparisonRunPayload[];
 }
 
 export interface OCRTraceStartResponse {
   run_id: string;
+  status?: string;
   ocr_result: {
     lines: string[];
     text: string;
@@ -86,6 +104,13 @@ export interface OCRTraceStartResponse {
   proofread_text: string;
   detected_language: string;
   final_confidence: number | null;
+  quality_label?: string;
+  downstream_mode?: string;
+  chunks_count?: number;
+  mentions_count?: number;
+  authority_report?: string | null;
+  mention_report?: string | null;
+  consolidated_report?: string | null;
 }
 
 export interface OCRTraceTable {
@@ -139,6 +164,7 @@ function normalizeLegacyResponse(payload: LegacyOCRExtractResponse): OCRExtractR
   return {
     status,
     model_used: payload.model_used,
+    run_id: null,
     fallbacks_used: payload.fallbacks_used ?? payload.fallbacks.map((item) => item.model),
     detected_language: detectedLanguage,
     language_confidence: null,
@@ -152,7 +178,7 @@ function normalizeLegacyResponse(payload: LegacyOCRExtractResponse): OCRExtractR
   };
 }
 
-export async function extractWithSaiaOcr(
+export async function extractPageText(
   payload: OCRExtractRequestPayload,
 ): Promise<OCRExtractResponse> {
   try {
@@ -183,6 +209,10 @@ export async function extractWithSaiaOcr(
   }
 }
 
+export const extractWithDefaultOcr = extractPageText;
+// Legacy export retained for compatibility; the extraction route is GLM-backed.
+export const extractWithSaiaOcr = extractPageText;
+
 export function normalizeTraceStartResponse(payload: OCRTraceStartResponse): OCRExtractResponse {
   const text = String(payload.proofread_text || payload.ocr_result.text || "");
   const lines = text
@@ -196,6 +226,7 @@ export function normalizeTraceStartResponse(payload: OCRTraceStartResponse): OCR
   return {
     status,
     model_used: "trace-pipeline",
+    run_id: payload.run_id,
     fallbacks_used: [],
     detected_language: payload.detected_language || payload.ocr_result.detected_language || "unknown",
     language_confidence: confidence,
@@ -204,11 +235,18 @@ export function normalizeTraceStartResponse(payload: OCRTraceStartResponse): OCR
     warnings,
     lines,
     text,
+    quality_label: payload.quality_label ?? null,
+    downstream_mode: payload.downstream_mode ?? null,
+    chunks_count: payload.chunks_count ?? null,
+    mentions_count: payload.mentions_count ?? null,
+    authority_report: payload.authority_report ?? null,
+    mention_report: payload.mention_report ?? null,
+    consolidated_report: payload.consolidated_report ?? null,
     fallbacks: [],
   };
 }
 
-export async function extractWithSaiaOcrTrace(
+export async function extractWithOcrTrace(
   payload: OCRExtractRequestPayload,
 ): Promise<OCRTraceStartResponse> {
   return apiFetch<OCRTraceStartResponse>("/ocr/page_with_trace", {
@@ -217,6 +255,9 @@ export async function extractWithSaiaOcrTrace(
     body: JSON.stringify(payload),
   });
 }
+
+// Legacy export retained for compatibility with older callers.
+export const extractWithSaiaOcrTrace = extractWithOcrTrace;
 
 export async function fetchTraceTables(runId: string): Promise<OCRTraceTablesResponse> {
   const clean = String(runId || "").trim();

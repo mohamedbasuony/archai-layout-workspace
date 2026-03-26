@@ -57,6 +57,14 @@ async def search_index(
         hits = rag_store.retrieve_chunks(
             query, top_k=top_k, run_ids=run_ids, asset_ref=asset_ref,
         )
-        return {"query": query, "top_k": top_k or 5, "results": hits}
+        entity_hits = rag_store.retrieve_entities(
+            query, top_k=top_k, run_ids=run_ids, asset_ref=asset_ref,
+        )
+        return {
+            "query": query,
+            "top_k": top_k or 5,
+            "results": hits,
+            "entity_results": entity_hits,
+        }
     except Exception as exc:  # pragma: no cover
         raise HTTPException(status_code=500, detail=f"Search failed: {exc}") from exc

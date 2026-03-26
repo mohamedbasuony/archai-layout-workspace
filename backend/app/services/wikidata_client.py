@@ -332,6 +332,66 @@ def search_wikidata(
 
 # ── Enrichment: VIAF + GeoNames from Wikidata ─────────────────────────
 
+
+def _best_lang_value(values: dict[str, Any] | None, *, preferred: tuple[str, ...] = ("en", "fr", "de")) -> str:
+    if not isinstance(values, dict):
+        return ""
+    for lang in preferred:
+        payload = values.get(lang)
+        if isinstance(payload, dict) and payload.get("value"):
+            return str(payload["value"])
+    for payload in values.values():
+        if isinstance(payload, dict) and payload.get("value"):
+            return str(payload["value"])
+    return ""
+
+
+def _extract_aliases(values: dict[str, Any] | None) -> list[dict[str, str]]:
+    if not isinstance(values, dict):
+        return []
+    aliases: list[dict[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for lang, entries in values.items():
+        if not isinstance(entries, list):
+            continue
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            value = str(entry.get("value") or "").strip()
+            if not value:
+                continue
+            key = (str(lang), value.casefold())
+            if key in seen:
+                continue
+            seen.add(key)
+            aliases.append({"lang": str(lang), "value": value})
+    return aliases
+
+
+def _claim_entity_ids(claims: dict[str, Any], prop: str) -> list[str]:
+    values: list[str] = []
+    for claim in claims.get(prop, []) or []:
+        mainsnak = claim.get("mainsnak", {})
+        datavalue = mainsnak.get("datavalue", {})
+        value = datavalue.get("value", {})
+        if isinstance(value, dict) and value.get("id"):
+            values.append(str(value["id"]))
+    return values
+
+
+def _coordinate_from_claims(claims: dict[str, Any]) -> tuple[float | None, float | None]:
+    for claim in claims.get("P625", []) or []:
+        mainsnak = claim.get("mainsnak", {})
+        datavalue = mainsnak.get("datavalue", {})
+        value = datavalue.get("value", {})
+        if not isinstance(value, dict):
+            continue
+        try:
+            return float(value.get("latitude")), float(value.get("longitude"))
+        except Exception:
+            continue
+    return None, None
+
 def enrich_wikidata_item(qid: str) -> dict[str, Any]:
     """Fetch VIAF (P214) and GeoNames (P1566) IDs for a Wikidata item.
 
@@ -349,7 +409,7 @@ def enrich_wikidata_item(qid: str) -> dict[str, Any]:
     params = {
         "action": "wbgetentities",
         "ids": qid,
-        "props": "claims",
+        "props": "claims|labels|aliases|descriptions",
         "format": "json",
     }
     data = _http_get(_WBGETENTITIES_URL, params)
@@ -385,10 +445,24 @@ def enrich_wikidata_item(qid: str) -> dict[str, Any]:
         if isinstance(val, dict) and val.get("id"):
             instance_of_qids.append(str(val["id"]))
 
+    canonical_label = _best_lang_value(entity.get("labels"))
+    description = _best_lang_value(entity.get("descriptions"))
+    aliases = _extract_aliases(entity.get("aliases"))
+    lat, lon = _coordinate_from_claims(claims)
+    country_qids = _claim_entity_ids(claims, "P17")
+    admin_qids = _claim_entity_ids(claims, "P131")
+
     result = {
         "viaf_id": viaf_id,
         "geonames_id": geonames_id,
         "instance_of_qids": instance_of_qids,
+        "canonical_label": canonical_label,
+        "description": description,
+        "aliases": aliases,
+        "lat": lat,
+        "lon": lon,
+        "country_qids": country_qids,
+        "admin_qids": admin_qids,
     }
     cache_put("wikidata_enrich", cache_key_str, [result])
     return result

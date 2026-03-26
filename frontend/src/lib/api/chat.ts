@@ -4,6 +4,15 @@ export interface ChatModelListResponse {
   models: string[];
   default_model: string;
   vision_models: string[];
+  task_models?: {
+    ocr_model: string;
+    chat_rag_model: string;
+    translation_model: string;
+    label_visual_model: string;
+    label_visual_fallback_model: string;
+    verifier_model: string;
+    embedding_model: string;
+  };
   base_url: string;
 }
 
@@ -28,6 +37,63 @@ export interface ChatCompletionPayload {
 export interface ChatCompletionResult {
   text: string;
   model?: string;
+  stage_metadata?: {
+    stage_name: string;
+    model_used: string;
+    mode_used?: string | null;
+    duration_ms?: number | null;
+  } | null;
+  inspection?: Record<string, unknown> | null;
+  verification?: {
+    assessment: string;
+    corrected_answer: string;
+    notes: string[];
+    citations_checked: string[];
+    model_used: string;
+    stage_metadata?: {
+      stage_name: string;
+      model_used: string;
+      mode_used?: string | null;
+      duration_ms?: number | null;
+    } | null;
+    inspection?: Record<string, unknown> | null;
+  } | null;
+}
+
+export interface LabelRegionPayload {
+  region_id: string;
+  bbox_xyxy: [number, number, number, number];
+  polygons?: number[][];
+}
+
+export interface LabelAnalysisPayload {
+  question: string;
+  label_name: string;
+  image_b64: string;
+  regions: LabelRegionPayload[];
+  filename?: string | null;
+  page_id?: string | null;
+  document_id?: string | null;
+}
+
+export interface LabelAnalysisResult {
+  status: string;
+  text: string;
+  label_name: string;
+  analysis_mode?: string | null;
+  model_used: string;
+  warnings: string[];
+  region_count: number;
+  crop_image_b64: string;
+  crop_bounds_xyxy: number[];
+  ocr_text?: string | null;
+  stage_metadata?: {
+    stage_name: string;
+    model_used: string;
+    mode_used?: string | null;
+    duration_ms?: number | null;
+  } | null;
+  inspection?: Record<string, unknown> | null;
 }
 
 interface StreamDelta {
@@ -39,6 +105,9 @@ interface StreamDone {
   type: "done";
   text: string;
   model?: string;
+  stage_metadata?: ChatCompletionResult["stage_metadata"];
+  inspection?: ChatCompletionResult["inspection"];
+  verification?: ChatCompletionResult["verification"];
 }
 
 interface StreamError {
@@ -102,6 +171,9 @@ export async function createChatCompletion(
   let buffer = "";
   let text = "";
   let model: string | undefined;
+  let stageMetadata: ChatCompletionResult["stage_metadata"] | undefined;
+  let inspection: ChatCompletionResult["inspection"] | undefined;
+  let verification: ChatCompletionResult["verification"] | undefined;
 
   while (true) {
     const { value, done } = await reader.read();
@@ -133,6 +205,9 @@ export async function createChatCompletion(
         } else if (event.type === "done") {
           text = event.text ?? text;
           model = event.model;
+          stageMetadata = event.stage_metadata;
+          inspection = event.inspection;
+          verification = event.verification;
         } else if (event.type === "error") {
           throw new Error(event.error || "Streaming completion failed.");
         }
@@ -142,5 +217,35 @@ export async function createChatCompletion(
     }
   }
 
-  return { text, model };
+  return { text, model, stage_metadata: stageMetadata, inspection, verification };
+}
+
+export async function analyzeSegmentLabel(
+  payload: LabelAnalysisPayload,
+): Promise<LabelAnalysisResult> {
+  const controller = new AbortController();
+  const timeoutId = window.setTimeout(() => controller.abort(), 85_000);
+  let res: Response;
+  try {
+    res = await fetch(apiUrl("/chat/label-analysis"), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+      signal: controller.signal,
+    });
+  } catch (error: unknown) {
+    if (error instanceof DOMException && error.name === "AbortError") {
+      throw new Error("Label analysis timed out. Please retry.");
+    }
+    throw error;
+  } finally {
+    window.clearTimeout(timeoutId);
+  }
+
+  if (!res.ok) {
+    const raw = await res.text();
+    throw new Error(parseErrorText(res.status, raw));
+  }
+
+  return (await res.json()) as LabelAnalysisResult;
 }

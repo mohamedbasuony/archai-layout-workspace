@@ -4,17 +4,17 @@ import { ChangeEvent, useEffect, useMemo, useRef, useState } from "react";
 import Image from "next/image";
 
 import {
+  analyzeSegmentLabel,
   createChatCompletion,
   getChatModels,
   type ChatMessagePayload,
+  type LabelRegionPayload,
 } from "@/lib/api/chat";
 import {
-  extractWithSaiaOcr,
+  extractPageText,
   fetchAuthorityReport,
   mergeOCRResultText,
-  type OCRRegionPayload,
   type OCRExtractResponse,
-  type OCRExtractRequestPayload,
 } from "@/lib/api/ocrAgent";
 import { predictSinglePage } from "@/lib/api/predict";
 import {
@@ -30,7 +30,16 @@ interface DocumentChatWorkspaceProps {
 }
 
 const STORAGE_KEY = "archai_workspace_state_v1";
-const LOCKED_MODEL_ID = "internvl3.5-30b-a3b";
+const DEFAULT_CHAT_MODEL_ID = "qwen3-30b-a3b-instruct-2507";
+const DEFAULT_TASK_MODELS = {
+  ocr_model: "glm-ocr:latest",
+  chat_rag_model: DEFAULT_CHAT_MODEL_ID,
+  translation_model: "llama-3.3-70b-instruct",
+  label_visual_model: "qwen3-vl-30b-a3b-instruct",
+  label_visual_fallback_model: "internvl3.5-30b-a3b",
+  verifier_model: "qwen3-235b-a22b",
+  embedding_model: "multilingual-e5-large-instruct",
+};
 const TEXT_LABEL_INCLUDE_TOKENS = [
   "script",
   "gloss",
@@ -51,6 +60,33 @@ const TEXT_LABEL_EXCLUDE_TOKENS = [
   "graphic",
   "music",
   "zone",
+];
+const SEGMENTATION_LABEL_VOCAB = [
+  "Border",
+  "Table",
+  "Diagram",
+  "Main script black",
+  "Main script coloured",
+  "Variant script black",
+  "Variant script coloured",
+  "Historiated",
+  "Inhabited",
+  "Zoo - Anthropomorphic",
+  "Embellished",
+  "Plain initial- coloured",
+  "Plain initial - Highlighted",
+  "Plain initial - Black",
+  "Page Number",
+  "Quire Mark",
+  "Running header",
+  "Catchword",
+  "Gloss",
+  "Illustrations",
+  "Column",
+  "GraphicZone",
+  "MusicLine",
+  "MusicZone",
+  "Music",
 ];
 
 interface CocoCategory {
@@ -75,6 +111,9 @@ interface OCRLocationSuggestion {
   category: string;
   bbox_xywh: [number, number, number, number];
 }
+
+type StoredLabelRegion = LabelRegionPayload;
+type StoredLabelRegionMap = Record<string, StoredLabelRegion[]>;
 
 interface PendingUploadDocument {
   baseName: string;
@@ -196,322 +235,6 @@ function extractLocationSuggestions(coco: CocoPayload | null | undefined): OCRLo
   });
 
   return suggestions.slice(0, 60);
-}
-
-function polygonArea(flatPoints: number[]): number {
-  if (!Array.isArray(flatPoints) || flatPoints.length < 6) {
-    return 0;
-  }
-  let area = 0;
-  for (let index = 0; index < flatPoints.length; index += 2) {
-    const nextIndex = (index + 2) % flatPoints.length;
-    area += (flatPoints[index] ?? 0) * (flatPoints[nextIndex + 1] ?? 0);
-    area -= (flatPoints[nextIndex] ?? 0) * (flatPoints[index + 1] ?? 0);
-  }
-  return Math.abs(area) / 2;
-}
-
-function bestAnnotationPolygon(annotation: CocoAnnotation): [number, number][] | undefined {
-  const polygons = annotationPolygons(annotation);
-  if (!polygons.length) {
-    return undefined;
-  }
-  const best = [...polygons].sort((left, right) => polygonArea(right) - polygonArea(left))[0] ?? null;
-  if (!best) {
-    return undefined;
-  }
-  const points: [number, number][] = [];
-  for (let index = 0; index < best.length; index += 2) {
-    const x = Number(best[index]);
-    const y = Number(best[index + 1]);
-    if (!Number.isFinite(x) || !Number.isFinite(y)) {
-      continue;
-    }
-    points.push([x, y]);
-  }
-  return points.length >= 3 ? points : undefined;
-}
-
-function regionSpecificity(label: string): number {
-  const key = label.toLowerCase();
-  if (key.includes("line")) {
-    return 0;
-  }
-  if (
-    key.includes("main script") ||
-    key.includes("variant script") ||
-    key.includes("gloss") ||
-    key.includes("header") ||
-    key.includes("catchword") ||
-    key.includes("page number") ||
-    key.includes("quire")
-  ) {
-    return 1;
-  }
-  return 2;
-}
-
-function isPreferredLineLabel(label: string): boolean {
-  const key = label.toLowerCase();
-  return key.includes("line") || key.includes("main script") || key.includes("variant script");
-}
-
-function bboxArea(bbox: [number, number, number, number]): number {
-  return Math.max(0, bbox[2] - bbox[0]) * Math.max(0, bbox[3] - bbox[1]);
-}
-
-function bboxCoverage(left: [number, number, number, number], right: [number, number, number, number]): number {
-  const interX1 = Math.max(left[0], right[0]);
-  const interY1 = Math.max(left[1], right[1]);
-  const interX2 = Math.min(left[2], right[2]);
-  const interY2 = Math.min(left[3], right[3]);
-  const interArea = Math.max(0, interX2 - interX1) * Math.max(0, interY2 - interY1);
-  const minArea = Math.max(1, Math.min(bboxArea(left), bboxArea(right)));
-  return interArea / minArea;
-}
-
-function extractStructuredRegions(coco: CocoPayload | null | undefined): OCRRegionPayload[] {
-  if (!coco) {
-    return [];
-  }
-
-  function isColumnLikeLabel(label: string): boolean {
-    const key = label.toLowerCase();
-    return /column|mainzone|main zone|text zone|main text area/.test(key);
-  }
-
-  function bboxOverlapRatio(left: [number, number, number, number], right: [number, number, number, number]): number {
-    const interX1 = Math.max(left[0], right[0]);
-    const interY1 = Math.max(left[1], right[1]);
-    const interX2 = Math.min(left[2], right[2]);
-    const interY2 = Math.min(left[3], right[3]);
-    const interArea = Math.max(0, interX2 - interX1) * Math.max(0, interY2 - interY1);
-    const leftArea = Math.max(1, bboxArea(left));
-    return interArea / leftArea;
-  }
-
-  function clusterRowsByColumns(
-    rows: Array<{
-      region_id: string;
-      label: string;
-      bbox_xyxy: [number, number, number, number];
-      polygon?: [number, number][];
-      specificity: number;
-    }>,
-    columnBoxes: Array<[number, number, number, number]>,
-  ) {
-    const assigned = new Map<number, typeof rows>();
-    for (let index = 0; index < columnBoxes.length; index += 1) {
-      assigned.set(index, []);
-    }
-    const overflow: typeof rows = [];
-    for (const row of rows) {
-      const centerX = (row.bbox_xyxy[0] + row.bbox_xyxy[2]) / 2;
-      let bestIndex = -1;
-      let bestScore = -1;
-      for (let index = 0; index < columnBoxes.length; index += 1) {
-        const columnBBox = columnBoxes[index];
-        const containsCenter = columnBBox[0] <= centerX && centerX <= columnBBox[2];
-        const overlap = bboxOverlapRatio(row.bbox_xyxy, columnBBox);
-        const score = overlap + (containsCenter ? 0.25 : 0);
-        if (score > bestScore) {
-          bestScore = score;
-          bestIndex = index;
-        }
-      }
-      if (bestIndex >= 0 && bestScore > 0.05) {
-        assigned.get(bestIndex)?.push(row);
-      } else {
-        overflow.push(row);
-      }
-    }
-    const ordered: typeof rows = [];
-    columnBoxes.forEach((_box, index) => {
-      const columnRows = [...(assigned.get(index) ?? [])].sort((left, right) => {
-        if (Math.abs(left.bbox_xyxy[1] - right.bbox_xyxy[1]) > 8) {
-          return left.bbox_xyxy[1] - right.bbox_xyxy[1];
-        }
-        return left.bbox_xyxy[0] - right.bbox_xyxy[0];
-      });
-      ordered.push(...columnRows);
-    });
-    ordered.push(...overflow.sort((left, right) => {
-      if (Math.abs(left.bbox_xyxy[1] - right.bbox_xyxy[1]) > 8) {
-        return left.bbox_xyxy[1] - right.bbox_xyxy[1];
-      }
-      return left.bbox_xyxy[0] - right.bbox_xyxy[0];
-    }));
-    return ordered;
-  }
-
-  function clusterRowsWithoutColumns(
-    rows: Array<{
-      region_id: string;
-      label: string;
-      bbox_xyxy: [number, number, number, number];
-      polygon?: [number, number][];
-      specificity: number;
-    }>,
-  ) {
-    const sortedRows = [...rows].sort((left, right) => {
-      const leftCenter = (left.bbox_xyxy[0] + left.bbox_xyxy[2]) / 2;
-      const rightCenter = (right.bbox_xyxy[0] + right.bbox_xyxy[2]) / 2;
-      if (Math.abs(leftCenter - rightCenter) > 8) {
-        return leftCenter - rightCenter;
-      }
-      return left.bbox_xyxy[1] - right.bbox_xyxy[1];
-    });
-    const pageWidth =
-      Math.max(...sortedRows.map((row) => row.bbox_xyxy[2])) -
-      Math.min(...sortedRows.map((row) => row.bbox_xyxy[0]));
-    const mergeGap = Math.max(80, pageWidth * 0.08);
-    const columns: Array<{
-      x1: number;
-      x2: number;
-      centerX: number;
-      rows: typeof rows;
-    }> = [];
-    for (const row of sortedRows) {
-      const centerX = (row.bbox_xyxy[0] + row.bbox_xyxy[2]) / 2;
-      let match: typeof columns[number] | null = null;
-      let matchDistance: number | null = null;
-      for (const column of columns) {
-        const overlap = Math.min(row.bbox_xyxy[2], column.x2) - Math.max(row.bbox_xyxy[0], column.x1);
-        const distance = overlap > 0 ? Math.abs(centerX - column.centerX) : Math.max(row.bbox_xyxy[0] - column.x2, column.x1 - row.bbox_xyxy[2], 0);
-        if (distance <= mergeGap && (matchDistance === null || distance < matchDistance)) {
-          match = column;
-          matchDistance = distance;
-        }
-      }
-      if (!match) {
-        columns.push({
-          x1: row.bbox_xyxy[0],
-          x2: row.bbox_xyxy[2],
-          centerX,
-          rows: [row],
-        });
-        continue;
-      }
-      match.rows.push(row);
-      match.x1 = Math.min(match.x1, row.bbox_xyxy[0]);
-      match.x2 = Math.max(match.x2, row.bbox_xyxy[2]);
-      match.centerX = match.rows.reduce((sum, item) => sum + (item.bbox_xyxy[0] + item.bbox_xyxy[2]) / 2, 0) / match.rows.length;
-    }
-    columns.sort((left, right) => left.x1 - right.x1);
-    return columns.flatMap((column) =>
-      [...column.rows].sort((left, right) => {
-        if (Math.abs(left.bbox_xyxy[1] - right.bbox_xyxy[1]) > 8) {
-          return left.bbox_xyxy[1] - right.bbox_xyxy[1];
-        }
-        return left.bbox_xyxy[0] - right.bbox_xyxy[0];
-      }),
-    );
-  }
-
-  const categories = Array.isArray(coco.categories) ? coco.categories : [];
-  const annotations = Array.isArray(coco.annotations) ? coco.annotations : [];
-  const categoryById = new Map<number, string>();
-  for (const category of categories) {
-    if (typeof category?.id === "number" && typeof category?.name === "string") {
-      categoryById.set(category.id, category.name);
-    }
-  }
-
-  const columnBoxes = annotations
-    .map((annotation) => {
-      if (!annotation || !Array.isArray(annotation.bbox) || annotation.bbox.length < 4) {
-        return null;
-      }
-      const label = categoryById.get(Number(annotation.category_id)) || "";
-      if (!isColumnLikeLabel(label)) {
-        return null;
-      }
-      const [x, y, w, h] = annotation.bbox;
-      if (![x, y, w, h].every((value) => Number.isFinite(value)) || w < 8 || h < 8) {
-        return null;
-      }
-      return [x, y, x + w, y + h] as [number, number, number, number];
-    })
-    .filter((value): value is [number, number, number, number] => Boolean(value))
-    .sort((left, right) => {
-      if (Math.abs(left[0] - right[0]) > 8) {
-        return left[0] - right[0];
-      }
-      return left[1] - right[1];
-    });
-
-  const candidates = annotations
-    .map((annotation) => {
-      if (!annotation || !Array.isArray(annotation.bbox) || annotation.bbox.length < 4) {
-        return null;
-      }
-      const label = categoryById.get(Number(annotation.category_id)) || "";
-      if (isColumnLikeLabel(label)) {
-        return null;
-      }
-      if (!label || !isRelevantTextLabel(label)) {
-        return null;
-      }
-      const [x, y, w, h] = annotation.bbox;
-      if (![x, y, w, h].every((value) => Number.isFinite(value)) || w < 8 || h < 8) {
-        return null;
-      }
-      return {
-        region_id: String(annotation.id),
-        label,
-        bbox_xyxy: [x, y, x + w, y + h] as [number, number, number, number],
-        polygon: bestAnnotationPolygon(annotation),
-        specificity: regionSpecificity(label),
-      };
-    })
-    .filter((value): value is {
-      region_id: string;
-      label: string;
-      bbox_xyxy: [number, number, number, number];
-      polygon?: [number, number][];
-      specificity: number;
-    } => Boolean(value));
-
-  const preferredCandidates = candidates.filter((candidate) => isPreferredLineLabel(candidate.label));
-  const workingSet = preferredCandidates.length ? preferredCandidates : candidates;
-  const preSortedWorkingSet = [...workingSet].sort((left, right) => {
-    if (left.specificity !== right.specificity) {
-      return left.specificity - right.specificity;
-    }
-    const areaDelta = bboxArea(left.bbox_xyxy) - bboxArea(right.bbox_xyxy);
-    if (Math.abs(areaDelta) > 1) {
-      return areaDelta;
-    }
-    if (Math.abs(left.bbox_xyxy[1] - right.bbox_xyxy[1]) > 8) {
-      return left.bbox_xyxy[1] - right.bbox_xyxy[1];
-    }
-    return left.bbox_xyxy[0] - right.bbox_xyxy[0];
-  });
-
-  const kept = preSortedWorkingSet.filter((candidate, index) => {
-    for (let cursor = 0; cursor < index; cursor += 1) {
-      const prior = preSortedWorkingSet[cursor];
-      if (prior.specificity > candidate.specificity) {
-        continue;
-      }
-      if (bboxCoverage(prior.bbox_xyxy, candidate.bbox_xyxy) >= 0.85) {
-        return false;
-      }
-    }
-    return true;
-  });
-
-  const ordered = columnBoxes.length
-    ? clusterRowsByColumns(kept, columnBoxes)
-    : clusterRowsWithoutColumns(kept);
-
-  return ordered.map((region, index) => ({
-    region_id: region.region_id,
-    bbox_xyxy: region.bbox_xyxy,
-    polygon: region.polygon,
-    label: region.label,
-    reading_order: index,
-  }));
 }
 
 function toBase64(dataUrl: string): string {
@@ -692,7 +415,6 @@ type OcrPromptHints = {
   languageHint?: string;
   ocrBackend?: "auto" | "kraken_mccatmus" | "kraken_catmus" | "kraken_cremma_medieval" | "kraken_cremma_lat";
 };
-type ExtractionEngineCardId = "kraken" | "calamari" | "glmocr";
 const EMPTY_DOCUMENT_METADATA: WorkspaceDocumentMetadata = {
   language: "",
   year: "",
@@ -889,91 +611,6 @@ function metadataToOcrHints(metadata: WorkspaceDocumentMetadata | null | undefin
   return scriptValue ? { scriptHintSeed: fallbackScriptHint, ocrBackend: "auto" } : {};
 }
 
-function isPrintLikeMetadata(metadata: WorkspaceDocumentMetadata | null | undefined): boolean {
-  const scriptValue = normalizeCommandText(metadata?.scriptFamily || "");
-  const typeValue = normalizeCommandText(metadata?.documentType || "");
-  const notesValue = normalizeCommandText(metadata?.notes || "");
-  return /(print|printed|imprint|fraktur|antiqua|humanistic|roman type)/.test(`${scriptValue} ${typeValue} ${notesValue}`);
-}
-
-function getExtractionEngineRecommendation(
-  userPrompt: string,
-  metadata: WorkspaceDocumentMetadata | null | undefined,
-): {
-  recommended: ExtractionEngineCardId;
-  detectedLanguage: string;
-  detectedScript: string;
-  autoRecommendation: string;
-} {
-  const hints = resolveOcrPromptHints(userPrompt, metadata);
-  const detectedLanguage = hints.languageHint || normalizeCommandText(metadata?.language || "") || "unknown";
-  const detectedScript = hints.scriptHintSeed || normalizeCommandText(metadata?.scriptFamily || "") || "unknown";
-  if (isPrintLikeMetadata(metadata)) {
-    if (/(old_french|middle_french|anglo_norman|french)/.test(detectedLanguage)) {
-      return {
-        recommended: "calamari",
-        detectedLanguage,
-        detectedScript,
-        autoRecommendation: "Calamari -> historical_french",
-      };
-    }
-    if (/(german|old_high_german|middle_high_german|dutch|flemish)/.test(detectedLanguage) || /(fraktur|blackletter)/.test(detectedScript)) {
-      return {
-        recommended: "calamari",
-        detectedLanguage,
-        detectedScript,
-        autoRecommendation: "Calamari -> fraktur_historical",
-      };
-    }
-    if (/(latin|italian|spanish|portuguese|catalan|occitan)/.test(detectedLanguage) || /(antiqua|humanistic|roman)/.test(detectedScript)) {
-      return {
-        recommended: "calamari",
-        detectedLanguage,
-        detectedScript,
-        autoRecommendation: "Calamari -> antiqua_historical / gt4histocr",
-      };
-    }
-  }
-  if (detectedLanguage === "latin") {
-    return {
-      recommended: "kraken",
-      detectedLanguage,
-      detectedScript,
-      autoRecommendation: "Kraken family -> CREMMA-Medieval-LAT, then CATMuS, then McCATMuS",
-    };
-  }
-  if (/(old_french|middle_french|anglo_norman|french)/.test(detectedLanguage)) {
-    return {
-      recommended: "kraken",
-      detectedLanguage,
-      detectedScript,
-      autoRecommendation: "Kraken family -> CREMMA Medieval, then CATMuS, then McCATMuS",
-    };
-  }
-  if (/(spanish|portuguese|catalan|iberian|italian|occitan)/.test(detectedLanguage)) {
-    return {
-      recommended: "kraken",
-      detectedLanguage,
-      detectedScript,
-      autoRecommendation: "Kraken family -> CATMuS, then McCATMuS",
-    };
-  }
-  if (/(german|old_high_german|middle_high_german|dutch|flemish|english|old_english|middle_english)/.test(detectedLanguage)) {
-    return {
-      recommended: "kraken",
-      detectedLanguage,
-      detectedScript,
-      autoRecommendation: "Kraken family -> McCATMuS, then CATMuS",
-    };
-  }
-  return {
-    recommended: "kraken",
-    detectedLanguage,
-    detectedScript,
-    autoRecommendation: "Kraken family -> CATMuS, then McCATMuS",
-  };
-}
-
 function resolveOcrPromptHints(text: string, metadata: WorkspaceDocumentMetadata | null | undefined): OcrPromptHints {
   const promptHints = extractOcrPromptHints(text);
   if (promptHints.languageHint || promptHints.scriptHintSeed) {
@@ -982,20 +619,70 @@ function resolveOcrPromptHints(text: string, metadata: WorkspaceDocumentMetadata
   return metadataToOcrHints(metadata);
 }
 
-function buildEnglishTranslationPrompt(sourceText: string): string {
+function translationLanguageHint(metadata: WorkspaceDocumentMetadata | null | undefined): string {
+  const language = String(metadata?.language || "").trim();
+  if (language) {
+    return language;
+  }
+  const hints = metadataToOcrHints(metadata);
+  if (hints.languageHint) {
+    return hints.languageHint.replace(/_/g, " ");
+  }
+  return "unknown";
+}
+
+function buildEnglishTranslationPrompt(
+  userRequest: string,
+  sourceText: string,
+  metadata: WorkspaceDocumentMetadata | null | undefined,
+): string {
+  const sourceLanguage = translationLanguageHint(metadata);
+  const sourceLanguageLower = sourceLanguage.toLowerCase();
+  const year = String(metadata?.year || "").trim();
+  const scriptFamily = String(metadata?.scriptFamily || "").trim();
+  const placeOrOrigin = String(metadata?.placeOrOrigin || "").trim();
+  const documentType = String(metadata?.documentType || "").trim();
+  const notes = String(metadata?.notes || "").trim();
   return [
-    "Translate the following OCR-extracted manuscript text into English.",
-    "This is a best-effort translation task.",
-    "Never refuse, block, or gate the translation.",
-    "Never answer with policy text such as 'the OCR is too uncertain' or similar.",
-    "Return plain English only.",
+    `Translate the extracted manuscript passage from ${sourceLanguage} into fluent, faithful English.`,
+    "This is a translation request, not an OCR request.",
+    "Use the OCR-extracted text below as the only text to translate.",
+    `Source language: ${sourceLanguage}.`,
+    "Target language: English.",
+    year ? `The manuscript year is: ${year}. Use this only as a weak historical-language hint.` : "",
+    scriptFamily ? `The manuscript script family is: ${scriptFamily}. Use this only as a weak reading hint.` : "",
+    placeOrOrigin ? `The manuscript place or origin is: ${placeOrOrigin}. Use this only as a weak dialect hint.` : "",
+    documentType ? `The manuscript document type is: ${documentType}. Use this only as a weak genre/context hint.` : "",
+    notes ? `Additional manuscript notes: ${notes}. Use this only as a weak contextual hint and never to invent text.` : "",
+    "Treat the extracted transcript as the authoritative source text to interpret and render into English.",
+    sourceLanguageLower.includes("old french")
+      ? "Treat spelling variation, abbreviation, and likely OCR distortions as expected features of Old French and resolve them contextually when the intended reading is reasonably clear."
+      : "Use sentence-level and passage-level context to resolve obvious orthographic or OCR-like distortions where the intended sense is reasonably clear.",
+    "Translate at the level of clauses, sentences, and the whole passage, not as a word-by-word gloss.",
+    "Produce the best coherent English rendering that the passage supports.",
+    "Prefer fluent English syntax over literal token-by-token paraphrase whenever the context makes the intended sense reasonably clear.",
+    "Keep the translation roughly proportional to the source passage; do not expand a damaged or repetitive passage into a longer narrative than the source supports.",
+    "Silently normalize obvious OCR-like distortions internally when the likely source reading is clear from context.",
+    "Do not turn an unclear token into a confident person, place, or plot detail unless the passage clearly supports that reading.",
+    "If a clause remains too corrupt to interpret confidently, mark only that local span with [unclear] instead of inventing connective narrative or repeated moral commentary.",
+    "Do not summarize, paraphrase away content, or answer questions about the text.",
+    "Preserve uncertainty only where it is genuinely unavoidable after contextual interpretation.",
+    "If a word or phrase remains unresolved, mark only that local span with [unclear] or [token?].",
+    "Do not invent meaning for genuinely unclear words or spans.",
+    "Do not echo opaque source tokens as if they were valid English unless they are clearly names or untranslated forms.",
+    "Do not describe the page, layout, decoration, or image.",
+    "Do not repeat the source text unchanged unless a token is genuinely unreadable.",
+    "Do not add a translator's note, note, explanation, or editorial commentary.",
+    "Return only the English translation.",
     "Do not return JSON.",
-    "Do not explain what you are doing.",
-    "If parts are uncertain, translate what you can and preserve uncertainty inline with markers like [unclear] or [?].",
+    "Do not explain your reasoning.",
     "",
-    "Source text:",
+    "User request:",
+    userRequest,
+    "",
+    "OCR-extracted source text:",
     sourceText,
-  ].join("\n");
+  ].filter(Boolean).join("\n");
 }
 
 function buildContextualUserPrompt(
@@ -1059,21 +746,8 @@ function cocoCategoryMap(coco: CocoPayload | null | undefined): Map<number, stri
   return out;
 }
 
-function availableCropLabels(coco: CocoPayload | null | undefined): string[] {
-  const byId = cocoCategoryMap(coco);
-  const labels = new Set<string>();
-  for (const annotation of coco?.annotations || []) {
-    const name = byId.get(Number(annotation.category_id));
-    if (name) {
-      labels.add(name);
-    }
-  }
-  return Array.from(labels).sort((a, b) => a.localeCompare(b));
-}
-
-function resolveCropLabelFromPrompt(text: string, coco: CocoPayload | null | undefined): string | null {
+function bestMatchingSegmentationLabel(text: string, labels: string[]): string | null {
   const prompt = normalizeLabelText(text);
-  const labels = availableCropLabels(coco);
   let bestLabel: string | null = null;
   let bestScore = 0;
 
@@ -1118,6 +792,42 @@ function annotationPolygons(annotation: CocoAnnotation): number[][] {
   return [];
 }
 
+function buildStoredLabelRegions(coco: CocoPayload | null | undefined): StoredLabelRegionMap {
+  const labelsById = cocoCategoryMap(coco);
+  const out: StoredLabelRegionMap = {};
+  for (const annotation of coco?.annotations || []) {
+    if (!annotation || !Array.isArray(annotation.bbox) || annotation.bbox.length < 4) {
+      continue;
+    }
+    const label = labelsById.get(Number(annotation.category_id));
+    if (!label) {
+      continue;
+    }
+    const [x, y, w, h] = annotation.bbox;
+    if (![x, y, w, h].every((value) => Number.isFinite(value))) {
+      continue;
+    }
+    const region: StoredLabelRegion = {
+      region_id: String(annotation.id),
+      bbox_xyxy: [x, y, x + w, y + h],
+      polygons: annotationPolygons(annotation),
+    };
+    if (!out[label]) {
+      out[label] = [];
+    }
+    out[label].push(region);
+  }
+  return out;
+}
+
+function availableStoredLabels(labelsByName: StoredLabelRegionMap | null | undefined): string[] {
+  return Object.keys(labelsByName || {}).sort((a, b) => a.localeCompare(b));
+}
+
+function resolveCropLabelFromPrompt(text: string, labelsByName: StoredLabelRegionMap | null | undefined): string | null {
+  return bestMatchingSegmentationLabel(text, availableStoredLabels(labelsByName));
+}
+
 function loadImageElement(src: string): Promise<HTMLImageElement> {
   return new Promise((resolve, reject) => {
     const image = new window.Image();
@@ -1129,11 +839,10 @@ function loadImageElement(src: string): Promise<HTMLImageElement> {
 
 async function buildTransparentCropOverlay(
   pageDataUrl: string,
-  coco: CocoPayload,
+  labelsByName: StoredLabelRegionMap,
   label: string,
 ): Promise<{ imageUrl: string; matchCount: number }> {
-  const categoryById = cocoCategoryMap(coco);
-  const matches = (coco.annotations || []).filter((annotation) => categoryById.get(Number(annotation.category_id)) === label);
+  const matches = labelsByName[label] || [];
   if (!matches.length) {
     throw new Error(`No regions found for label: ${label}`);
   }
@@ -1150,7 +859,7 @@ async function buildTransparentCropOverlay(
   ctx.clearRect(0, 0, canvas.width, canvas.height);
 
   for (const annotation of matches) {
-    const polygons = annotationPolygons(annotation);
+    const polygons = annotation.polygons || [];
     if (polygons.length) {
       for (const polygon of polygons) {
         ctx.save();
@@ -1172,10 +881,10 @@ async function buildTransparentCropOverlay(
       continue;
     }
 
-    const [x, y, w, h] = annotation.bbox;
+    const [x1, y1, x2, y2] = annotation.bbox_xyxy;
     ctx.save();
     ctx.beginPath();
-    ctx.rect(x, y, w, h);
+    ctx.rect(x1, y1, x2 - x1, y2 - y1);
     ctx.clip();
     ctx.drawImage(source, 0, 0, canvas.width, canvas.height);
     ctx.restore();
@@ -1197,7 +906,8 @@ export function DocumentChatWorkspace({ initialDocumentId }: DocumentChatWorkspa
   const [messagesByDocument, setMessagesByDocument] = useState<Record<string, WorkspaceChatMessage[]>>({});
 
   const [visionModelIds, setVisionModelIds] = useState<Set<string>>(new Set());
-  const [selectedModel, setSelectedModel] = useState<string>(LOCKED_MODEL_ID);
+  const [taskModels, setTaskModels] = useState(DEFAULT_TASK_MODELS);
+  const [selectedModel, setSelectedModel] = useState<string>(DEFAULT_CHAT_MODEL_ID);
   const [includeCurrentPageImage, setIncludeCurrentPageImage] = useState(false);
 
   const [input, setInput] = useState("");
@@ -1205,22 +915,16 @@ export function DocumentChatWorkspace({ initialDocumentId }: DocumentChatWorkspa
   const [assistantLoadingLabel, setAssistantLoadingLabel] = useState("Thinking");
   const [error, setError] = useState<string | null>(null);
   const [segmentedPreviewByPageId, setSegmentedPreviewByPageId] = useState<Record<string, string>>({});
-  const [segmentationCocoByPageId, setSegmentationCocoByPageId] = useState<Record<string, CocoPayload>>({});
+  const [segmentationLabelsByPageId, setSegmentationLabelsByPageId] = useState<Record<string, StoredLabelRegionMap>>({});
   const [segmentationErrorByPageId, setSegmentationErrorByPageId] = useState<Record<string, string>>({});
   const [ocrTextByPageId, setOcrTextByPageId] = useState<Record<string, string>>({});
   const [ocrRunIdByPageId, setOcrRunIdByPageId] = useState<Record<string, string>>({});
   const [authorityReportByPageId, setAuthorityReportByPageId] = useState<Record<string, string>>({});
-  const [segmentingPageId, setSegmentingPageId] = useState<string | null>(null);
+  const [, setSegmentingPageId] = useState<string | null>(null);
   const [showSegmentationOverlay, setShowSegmentationOverlay] = useState(true);
   const [pendingUpload, setPendingUpload] = useState<PendingUploadDocument | null>(null);
   const [metadataDraft, setMetadataDraft] = useState<WorkspaceDocumentMetadata>(EMPTY_DOCUMENT_METADATA);
   const [metadataError, setMetadataError] = useState<string | null>(null);
-  const [showEngineSelector, setShowEngineSelector] = useState(false);
-  const [pendingExtractionOptions, setPendingExtractionOptions] = useState<{
-    userPrompt: string;
-    compareBackends?: ("calamari" | "glmocr")[];
-    ocrBackend?: "auto" | "calamari" | "glmocr";
-  } | null>(null);
   const chatScrollContainerRef = useRef<HTMLDivElement | null>(null);
   const chatScrollAnchorRef = useRef<HTMLDivElement | null>(null);
 
@@ -1237,17 +941,12 @@ export function DocumentChatWorkspace({ initialDocumentId }: DocumentChatWorkspa
   const currentZoom = currentDocument ? zoomByDocument[currentDocument.id] ?? 1 : 1;
   const currentMessages = currentDocument ? (messagesByDocument[currentDocument.id] ?? []) : [];
   const currentSegmentedPreview = currentPage ? (segmentedPreviewByPageId[currentPage.id] ?? null) : null;
-  const currentSegmentationCoco = currentPage ? (segmentationCocoByPageId[currentPage.id] ?? null) : null;
+  const currentSegmentationLabels = currentPage ? (segmentationLabelsByPageId[currentPage.id] ?? null) : null;
   const currentSegmentationError = currentPage ? (segmentationErrorByPageId[currentPage.id] ?? null) : null;
   const currentExtractedText = currentPage ? (ocrTextByPageId[currentPage.id] ?? "") : "";
   const currentOcrRunId = currentPage ? (ocrRunIdByPageId[currentPage.id] ?? "") : "";
   const currentAuthorityReport = currentPage ? (authorityReportByPageId[currentPage.id] ?? "") : "";
-  const currentPageIsSegmenting = Boolean(currentPage && segmentingPageId === currentPage.id);
   const currentMetadata = currentDocument?.metadata ?? null;
-  const extractionEngineRecommendation = getExtractionEngineRecommendation(
-    pendingExtractionOptions?.userPrompt || "",
-    currentMetadata,
-  );
 
   useEffect(() => {
     const container = chatScrollContainerRef.current;
@@ -1272,10 +971,8 @@ export function DocumentChatWorkspace({ initialDocumentId }: DocumentChatWorkspa
           return;
         }
         setVisionModelIds(new Set(payload.vision_models));
-        setSelectedModel(LOCKED_MODEL_ID);
-        if (!payload.models.includes(LOCKED_MODEL_ID)) {
-          setError(`Locked model ${LOCKED_MODEL_ID} is not available on the backend.`);
-        }
+        setTaskModels(payload.task_models || DEFAULT_TASK_MODELS);
+        setSelectedModel(payload.default_model || payload.task_models?.chat_rag_model || DEFAULT_CHAT_MODEL_ID);
       })
       .catch((err: unknown) => {
         if (cancelled) {
@@ -1300,7 +997,7 @@ export function DocumentChatWorkspace({ initialDocumentId }: DocumentChatWorkspa
 
       const parsed = JSON.parse(raw) as WorkspacePersistedState;
       setIncludeCurrentPageImage(Boolean(parsed.includeCurrentPageImage));
-      setSelectedModel(LOCKED_MODEL_ID);
+      setSelectedModel(DEFAULT_CHAT_MODEL_ID);
     } catch {
       // Ignore malformed persisted state.
     } finally {
@@ -1463,6 +1160,7 @@ export function DocumentChatWorkspace({ initialDocumentId }: DocumentChatWorkspa
       forcedImageDataUrl?: string;
       loadingLabel?: string;
       modelOverride?: string;
+      chatStage?: string;
       historyForModel?: WorkspaceChatMessage[];
     },
   ): Promise<{ ok: boolean; error?: string }> => {
@@ -1481,9 +1179,10 @@ export function DocumentChatWorkspace({ initialDocumentId }: DocumentChatWorkspa
         ? explicitImageAttach
         : (forcedImageAttach || includeCurrentPageImage);
     const imageDataUrl = options?.forcedImageDataUrl ?? currentPage?.dataUrl ?? null;
-    const requestedModel = (options?.modelOverride || selectedModel || LOCKED_MODEL_ID).trim();
-    const modelForRequest = requestedModel;
+    const requestedModel = (options?.modelOverride || selectedModel || taskModels.chat_rag_model || DEFAULT_CHAT_MODEL_ID).trim();
+    let modelForRequest = requestedModel;
     const priorMessagesForModel = [...(options?.historyForModel ?? currentMessages)];
+    const chatStage = options?.chatStage || (shouldAttachImage ? "visual_chat" : "rag_chat");
 
     if (shouldAttachImage && !imageDataUrl) {
       setError("No current page image available to attach.");
@@ -1491,8 +1190,15 @@ export function DocumentChatWorkspace({ initialDocumentId }: DocumentChatWorkspa
     }
     if (shouldAttachImage) {
       if (!modelForRequest || !visionModelIds.has(modelForRequest)) {
-        setError(`Locked model ${LOCKED_MODEL_ID} is not vision-capable or unavailable.`);
-        return { ok: false, error: "Locked model is not vision-capable." };
+        const fallbackVisionModel =
+          [taskModels.label_visual_model, taskModels.label_visual_fallback_model]
+            .find((candidate) => candidate && visionModelIds.has(candidate))
+          || "";
+        if (!fallbackVisionModel) {
+          setError("No vision-capable chat model is available on the backend.");
+          return { ok: false, error: "No vision-capable chat model is available." };
+        }
+        modelForRequest = fallbackVisionModel;
       }
     }
     if (!modelForRequest) {
@@ -1551,13 +1257,20 @@ export function DocumentChatWorkspace({ initialDocumentId }: DocumentChatWorkspa
           temperature: 0.2,
           stream: true,
           context: {
+            chat_stage: chatStage,
             document_id: currentDocument.id,
             filename: currentPage?.name || currentDocument.name,
             current_page_index: currentPageIndex,
             page_count: currentDocument.pages.length,
             transcript: currentExtractedText || undefined,
-            authority_report: currentAuthorityReport || undefined,
+            authority_report: chatStage === "translation" ? undefined : (currentAuthorityReport || undefined),
             ocr_run_id: currentOcrRunId || undefined,
+            document_language: currentMetadata?.language || undefined,
+            document_year: currentMetadata?.year || undefined,
+            place_or_origin: currentMetadata?.placeOrOrigin || undefined,
+            script_family: currentMetadata?.scriptFamily || undefined,
+            document_type: currentMetadata?.documentType || undefined,
+            document_notes: currentMetadata?.notes || undefined,
           },
         },
         (delta) => {
@@ -1621,7 +1334,9 @@ export function DocumentChatWorkspace({ initialDocumentId }: DocumentChatWorkspa
     };
 
     const intent = detectWorkspaceIntent(text);
-    const matchedLabel = resolveCropLabelFromPrompt(text, currentSegmentationCoco);
+    const matchedLabel =
+      resolveCropLabelFromPrompt(text, currentSegmentationLabels)
+      || bestMatchingSegmentationLabel(text, SEGMENTATION_LABEL_VOCAB);
 
     if (!intent && matchedLabel && isLabelAnalysisPrompt(text)) {
       appendMessages(documentId, [userMessage]);
@@ -1643,8 +1358,7 @@ export function DocumentChatWorkspace({ initialDocumentId }: DocumentChatWorkspa
 
     if (intent === "extract") {
       appendMessages(documentId, [userMessage]);
-      setPendingExtractionOptions({ userPrompt: text });
-      setShowEngineSelector(true);
+      await handleExtractTextInChat({ userPrompt: text });
       return;
     }
 
@@ -1663,7 +1377,7 @@ export function DocumentChatWorkspace({ initialDocumentId }: DocumentChatWorkspa
     await sendPromptToChat(text, { loadingLabel: "Thinking" });
   };
 
-  const runSegmentationForCurrentPage = async (): Promise<{ previewUrl: string; coco: CocoPayload } | null> => {
+  const runSegmentationForCurrentPage = async (): Promise<{ previewUrl: string; coco: CocoPayload; labelsByName: StoredLabelRegionMap } | null> => {
     if (!currentPage) {
       return null;
     }
@@ -1682,8 +1396,9 @@ export function DocumentChatWorkspace({ initialDocumentId }: DocumentChatWorkspa
       const url = `${result.annotated_image_url}${suffix}t=${Date.now()}`;
       setSegmentedPreviewByPageId((prev) => ({ ...prev, [currentPage.id]: url }));
       const coco = (result.coco_json || {}) as CocoPayload;
-      setSegmentationCocoByPageId((prev) => ({ ...prev, [currentPage.id]: coco }));
-      return { previewUrl: url, coco };
+      const labelsByName = buildStoredLabelRegions(coco);
+      setSegmentationLabelsByPageId((prev) => ({ ...prev, [currentPage.id]: labelsByName }));
+      return { previewUrl: url, coco, labelsByName };
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : "Segmentation failed.";
       setSegmentationErrorByPageId((prev) => ({ ...prev, [currentPage.id]: message }));
@@ -1723,23 +1438,25 @@ export function DocumentChatWorkspace({ initialDocumentId }: DocumentChatWorkspa
     };
 
     setError(null);
+    setSending(true);
+    setAssistantLoadingLabel("Analyzing label");
 
     try {
-      let coco = currentSegmentationCoco;
-      if (!coco) {
+      let labelsByName = currentSegmentationLabels;
+      if (!labelsByName) {
         setLabelStatus("Label analysis status: running segmentation first...");
         const segmentation = await runSegmentationForCurrentPage();
-        coco = segmentation?.coco ?? null;
+        labelsByName = segmentation?.labelsByName ?? null;
       }
 
-      if (!coco) {
+      if (!labelsByName) {
         setLabelStatus("Label analysis failed: segmentation data is unavailable.");
         return;
       }
 
-      const label = resolveCropLabelFromPrompt(userText, coco);
+      const label = resolveCropLabelFromPrompt(userText, labelsByName);
       if (!label) {
-        const labels = availableCropLabels(coco);
+        const labels = availableStoredLabels(labelsByName);
         appendMessages(currentDocumentId, [
           {
             id: makeId("msg-assistant-label-analysis-no-match"),
@@ -1754,34 +1471,46 @@ export function DocumentChatWorkspace({ initialDocumentId }: DocumentChatWorkspa
         return;
       }
 
-      setLabelStatus(`Label analysis status: cropping "${label}" and sending it to the model...`);
-      const cropped = await buildTransparentCropOverlay(currentPage.dataUrl, coco, label);
-      const prompt = [
-        "Answer the user's question about the attached cropped manuscript label image.",
-        "The attached image contains only the requested label in its original page position.",
-        "Label name:",
-        label,
-        "",
-        "User request:",
-        userText,
-        "",
-        "Focus on visible form, ornament, likely art style, decorative function, and plausible historical/manuscript context.",
-        "Do not mention internal pipeline steps.",
-      ].join("\n");
+      const regions = labelsByName[label] || [];
+      if (!regions.length) {
+        setLabelStatus(`Label analysis failed: no stored coordinates found for "${label}".`);
+        return;
+      }
 
-      await sendPromptToChat(prompt, {
-        displayText: userText,
-        attachImage: true,
-        forcedImageDataUrl: cropped.imageUrl,
-        loadingLabel: "Analyzing label",
-        historyForModel: [],
+      setLabelStatus(`Label analysis status: cropping "${label}" and analyzing it...`);
+      const response = await analyzeSegmentLabel({
+        question: userText,
+        label_name: label,
+        image_b64: toBase64(currentPage.dataUrl),
+        regions,
+        filename: currentPage.name,
+        page_id: currentPage.id,
+        document_id: currentDocumentId,
       });
-      setLabelStatus(`Label analysis complete for "${label}".`);
+      appendMessages(currentDocumentId, [
+        {
+          id: makeId("msg-assistant-label-analysis"),
+          role: "assistant",
+          content: response.text,
+          createdAt: Date.now(),
+          imageUrl: `data:image/png;base64,${response.crop_image_b64}`,
+          imageAlt: `${label} crop`,
+        },
+      ]);
+      if (response.warnings.length) {
+        setError(response.warnings.join(" | "));
+      }
+      setLabelStatus(
+        response.analysis_mode
+          ? `Label analysis complete for "${label}" in ${response.analysis_mode} mode using ${response.model_used}.`
+          : `Label analysis complete for "${label}" using ${response.model_used}.`,
+      );
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : "Label analysis request failed.";
       setError(message);
       setLabelStatus(`Label analysis failed: ${message}`);
     } finally {
+      setSending(false);
       setAssistantLoadingLabel("Thinking");
     }
   };
@@ -1871,21 +1600,21 @@ export function DocumentChatWorkspace({ initialDocumentId }: DocumentChatWorkspa
     setError(null);
 
     try {
-      let coco = currentSegmentationCoco;
-      if (!coco) {
+      let labelsByName = currentSegmentationLabels;
+      if (!labelsByName) {
         setCropStatus("Crop status: running segmentation first...");
         const segmentation = await runSegmentationForCurrentPage();
-        coco = segmentation?.coco ?? null;
+        labelsByName = segmentation?.labelsByName ?? null;
       }
 
-      if (!coco) {
+      if (!labelsByName) {
         setCropStatus("Crop failed: segmentation data is unavailable.");
         return;
       }
 
-      const label = resolveCropLabelFromPrompt(userText, coco);
+      const label = resolveCropLabelFromPrompt(userText, labelsByName);
       if (!label) {
-        const labels = availableCropLabels(coco);
+        const labels = availableStoredLabels(labelsByName);
         appendMessages(currentDocumentId, [
           {
             id: makeId("msg-assistant-crop-no-match"),
@@ -1901,7 +1630,7 @@ export function DocumentChatWorkspace({ initialDocumentId }: DocumentChatWorkspa
       }
 
       setCropStatus(`Crop status: isolating "${label}" from the page...`);
-      const cropped = await buildTransparentCropOverlay(currentPage.dataUrl, coco, label);
+      const cropped = await buildTransparentCropOverlay(currentPage.dataUrl, labelsByName, label);
       appendMessages(currentDocumentId, [
         {
           id: makeId("msg-assistant-crop-image"),
@@ -1927,13 +1656,10 @@ export function DocumentChatWorkspace({ initialDocumentId }: DocumentChatWorkspa
     includeDebugOutput?: boolean;
     silent?: boolean;
     userPrompt?: string;
-    ocrBackend?: "auto" | "calamari" | "glmocr";
-    compareBackends?: ("calamari" | "glmocr")[];
   }): Promise<{ text: string; runId: string; authorityReport: string } | null> => {
     if (!currentPage || !currentDocument) {
       return null;
     }
-    const includeDebugOutput = options?.includeDebugOutput ?? true;
     const silent = options?.silent ?? false;
     const userPrompt = options?.userPrompt ?? "";
     const currentDocumentId = currentDocument.id;
@@ -1977,32 +1703,17 @@ export function DocumentChatWorkspace({ initialDocumentId }: DocumentChatWorkspa
     setSending(true);
     setAssistantLoadingLabel("Extracting text");
     try {
-      setExtractionStatus(
-        options?.compareBackends?.length
-          ? "Extraction status: running segmentation-guided OCR comparison..."
-          : "Extraction status: running segmentation-guided OCR..."
-      );
-
-      let locationSuggestions = extractLocationSuggestions(currentSegmentationCoco);
-      let structuredRegions = extractStructuredRegions(currentSegmentationCoco);
-      if (!locationSuggestions.length) {
-        const segmentation = await runSegmentationForCurrentPage();
-        locationSuggestions = extractLocationSuggestions(segmentation?.coco ?? null);
-        structuredRegions = extractStructuredRegions(segmentation?.coco ?? null);
-      }
+      setExtractionStatus("Extraction status: running GLM OCR...");
 
       const ocrHints = resolveOcrPromptHints(userPrompt, currentMetadata);
-      const response = await extractWithSaiaOcr({
+      const response = await extractPageText({
         document_id: currentDocumentId,
         image_id: currentDocumentId,
         page_id: currentPage.id,
         image_b64: toBase64(currentPage.dataUrl),
         script_hint_seed: ocrHints.scriptHintSeed,
         language_hint: ocrHints.languageHint,
-        ocr_backend: (options?.ocrBackend as OCRExtractRequestPayload["ocr_backend"]) ?? "auto",
-        compare_backends: (options?.compareBackends as OCRExtractRequestPayload["compare_backends"]) ?? [],
-        location_suggestions: locationSuggestions,
-        regions: structuredRegions,
+        ocr_backend: "glmocr",
         apply_proofread: false,
         metadata: currentMetadata ? {
           language: currentMetadata.language,
@@ -2016,32 +1727,15 @@ export function DocumentChatWorkspace({ initialDocumentId }: DocumentChatWorkspa
 
       const rawExtractedText = mergeOCRResultText(response);
       const finalText = removeTextUncertainties(rawExtractedText);
-      const comparisonText = (response.comparison_runs ?? [])
-        .map((run) => {
-          const cleaned = removeTextUncertainties(String(run.text || "").trim());
-          const warnings = (run.warnings ?? []).filter(Boolean);
-          const notes = (run.notes ?? []).filter(Boolean);
-          const confidence = typeof run.confidence === "number" ? ` confidence=${run.confidence.toFixed(3)}` : "";
-          const hintText = [run.language_hint ? `language=${run.language_hint}` : "", run.script_family ? `script=${run.script_family}` : ""]
-            .filter(Boolean)
-            .join(" ");
-          const warningText = warnings.length ? `\nWarnings: ${warnings.join("; ")}` : "";
-          const notesText = notes.length ? `\nNotes: ${notes.join("; ")}` : "";
-          return [
-            `${run.selected ? "Selected" : "Compared"} OCR: ${run.backend_name} (${run.model_name})${confidence}${hintText ? ` ${hintText}` : ""}`,
-            cleaned || "(no readable text detected)",
-            warningText,
-            notesText,
-          ].filter(Boolean).join("\n");
-        })
-        .join("\n\n---\n\n")
-        .trim();
-      const fallbackStateText = (response.comparison_runs ?? [])
-        .map((run) => removeTextUncertainties(String(run.text || "").trim()))
-        .find((value) => Boolean(value));
-      const storedText = finalText || fallbackStateText || "";
-      const hasComparisonText = Boolean(comparisonText);
-      if (!finalText && !hasComparisonText) {
+      const storedText = finalText || "";
+      const runId = String(response.run_id || "").trim();
+      const authorityReport = String(
+        response.consolidated_report
+        || response.authority_report
+        || response.mention_report
+        || "",
+      ).trim();
+      if (!finalText) {
         const status = getExtractionStatus(response);
         setExtractionStatus(`Extraction complete (${status}): no readable text detected.`);
         if (!silent) {
@@ -2059,26 +1753,30 @@ export function DocumentChatWorkspace({ initialDocumentId }: DocumentChatWorkspa
       }
 
       setOcrTextByPageId((prev) => ({ ...prev, [currentPage.id]: storedText }));
-      setOcrRunIdByPageId((prev) => ({ ...prev, [currentPage.id]: "" }));
-      setAuthorityReportByPageId((prev) => ({ ...prev, [currentPage.id]: "" }));
+      setOcrRunIdByPageId((prev) => ({ ...prev, [currentPage.id]: runId }));
+      setAuthorityReportByPageId((prev) => ({ ...prev, [currentPage.id]: authorityReport }));
 
       if (!silent) {
         setMessagesByDocument((prev) => ({
           ...prev,
           [currentDocumentId]: (prev[currentDocumentId] ?? []).map((msg) =>
             msg.id === assistantMessageId
-              ? { ...msg, content: (options?.compareBackends?.length ? comparisonText : finalText) || finalText }
+              ? { ...msg, content: finalText }
               : msg,
           ),
         }));
       }
       const status = getExtractionStatus(response);
+      const pipelineBits = [
+        typeof response.chunks_count === "number" ? `${response.chunks_count} chunks` : "",
+        typeof response.mentions_count === "number" ? `${response.mentions_count} mentions` : "",
+      ].filter(Boolean);
       setExtractionStatus(
-        options?.compareBackends?.length
-          ? `Extraction comparison complete (${status}).`
-          : `Extraction complete (${status}).`
+        pipelineBits.length
+          ? `Extraction complete (${status}). Knowledge pipeline: ${pipelineBits.join(", ")}.`
+          : `Extraction complete (${status}).`,
       );
-      return { text: storedText, runId: "", authorityReport: "" };
+      return { text: storedText, runId, authorityReport };
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : "request failed";
       setExtractionStatus(`Extraction failed: ${message}`);
@@ -2112,14 +1810,13 @@ export function DocumentChatWorkspace({ initialDocumentId }: DocumentChatWorkspa
       return;
     }
 
-    const prompt = buildContextualUserPrompt(userRequest, {
-      sourceText,
-      mode: "translation",
-    });
+    const prompt = buildEnglishTranslationPrompt(userRequest, sourceText, currentMetadata);
     await sendPromptToChat(prompt, {
       displayText: userRequest,
       attachImage: false,
       loadingLabel: "Translating",
+      modelOverride: taskModels.translation_model,
+      chatStage: "translation",
       historyForModel: [],
     });
   };
@@ -2169,6 +1866,7 @@ export function DocumentChatWorkspace({ initialDocumentId }: DocumentChatWorkspa
       displayText: userText,
       attachImage: false,
       loadingLabel: "Checking entities",
+      chatStage: "entity_qa",
       historyForModel: [],
     });
   };
@@ -2542,110 +2240,6 @@ export function DocumentChatWorkspace({ initialDocumentId }: DocumentChatWorkspa
           </div>
         </div>
       ) : null}
-      {showEngineSelector && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 px-4">
-          <div className="w-full max-w-3xl rounded-xl border bg-background p-6 shadow-2xl">
-            <h3 className="text-lg font-semibold mb-1">Select OCR Engine</h3>
-            <p className="text-sm text-muted-foreground mb-4">
-              Choose which recognition engine to use for text extraction. Detected language/script hint:
-              {` ${extractionEngineRecommendation.detectedLanguage || "unknown"}`}
-              {extractionEngineRecommendation.detectedScript && extractionEngineRecommendation.detectedScript !== "unknown"
-                ? ` / ${extractionEngineRecommendation.detectedScript}`
-                : ""}
-              . Auto recommendation: {extractionEngineRecommendation.autoRecommendation}.
-            </p>
-            <div className="grid gap-3 md:grid-cols-3">
-              <button
-                type="button"
-                onClick={() => {
-                  setShowEngineSelector(false);
-                  handleExtractTextInChat({ ...pendingExtractionOptions, ocrBackend: "auto", compareBackends: [] });
-                  setPendingExtractionOptions(null);
-                }}
-                className={`rounded-lg border p-4 hover:bg-muted transition text-left ${
-                  extractionEngineRecommendation.recommended === "kraken" ? "border-primary ring-2 ring-primary/30" : ""
-                }`}
-              >
-                <div className="flex items-center justify-between gap-2">
-                  <div className="font-medium">Kraken family</div>
-                  <span className="rounded-full bg-primary/10 px-2 py-0.5 text-[11px] font-medium text-primary">Recommended</span>
-                </div>
-                <div className="text-xs text-muted-foreground mt-2">
-                  Best manuscript OCR path in this repo using segmented line crops and medieval-trained models.
-                </div>
-                <div className="text-xs mt-2"><span className="font-medium">Best for:</span> Latin, Old French, Middle French, Anglo-Norman</div>
-                <div className="text-xs mt-1"><span className="font-medium">Also good for:</span> Spanish/Iberian, Italian</div>
-                <div className="text-xs mt-2 text-muted-foreground">
-                  Best choice for medieval handwritten Latin-script material. Uses segmentation-driven line OCR.
-                </div>
-              </button>
-              <button
-                type="button"
-                onClick={() => {
-                  setShowEngineSelector(false);
-                  handleExtractTextInChat({ ...pendingExtractionOptions, ocrBackend: "calamari", compareBackends: [] });
-                  setPendingExtractionOptions(null);
-                }}
-                className={`rounded-lg border p-4 hover:bg-muted transition text-left ${
-                  extractionEngineRecommendation.recommended === "calamari" ? "border-primary ring-2 ring-primary/30" : ""
-                }`}
-              >
-                <div className="flex items-center justify-between gap-2">
-                  <div className="font-medium">Calamari</div>
-                  <span className="rounded-full bg-muted px-2 py-0.5 text-[11px] font-medium text-muted-foreground">Historical print baseline</span>
-                </div>
-                <div className="text-xs text-muted-foreground mt-2">
-                  Line OCR backend best suited to historical print and broad fallback experiments.
-                </div>
-                <div className="text-xs mt-2"><span className="font-medium">Best for:</span> historical printed German/Fraktur, historical printed Latin, later historical printed French</div>
-                <div className="text-xs mt-2 text-muted-foreground">
-                  Not the best default for medieval handwritten manuscripts. Useful for comparison and print-like material.
-                </div>
-              </button>
-              <button
-                type="button"
-                onClick={() => {
-                  setShowEngineSelector(false);
-                  handleExtractTextInChat({ ...pendingExtractionOptions, ocrBackend: "glmocr", compareBackends: [] });
-                  setPendingExtractionOptions(null);
-                }}
-                className="rounded-lg border p-4 hover:bg-muted transition text-left"
-              >
-                <div className="flex items-center justify-between gap-2">
-                  <div className="font-medium">GLM-OCR</div>
-                  <span className="rounded-full bg-amber-500/10 px-2 py-0.5 text-[11px] font-medium text-amber-700">Experimental</span>
-                </div>
-                <div className="text-xs text-muted-foreground mt-2">
-                  General multimodal OCR for full-page or column-level document extraction.
-                </div>
-                <div className="text-xs mt-2"><span className="font-medium">Best for:</span> broad multilingual documents, complex modern layouts, page/column OCR experiments</div>
-                <div className="text-xs mt-2 text-muted-foreground">
-                  Not specialized for medieval manuscript line transcription.
-                </div>
-              </button>
-            </div>
-            <button
-              type="button"
-              onClick={() => {
-                setShowEngineSelector(false);
-                handleExtractTextInChat({ ...pendingExtractionOptions, ocrBackend: "auto", compareBackends: ["calamari", "glmocr"] });
-                setPendingExtractionOptions(null);
-              }}
-              className="mt-4 w-full rounded-lg border p-4 text-left hover:bg-muted transition"
-            >
-              <div className="font-medium">Compare all three</div>
-              <div className="text-xs text-muted-foreground mt-1">Run Kraken family, Calamari, and GLM-OCR together and return the three assembled transcriptions with backend, model, warnings, and confidence metadata.</div>
-            </button>
-            <button
-              type="button"
-              onClick={() => { setShowEngineSelector(false); setPendingExtractionOptions(null); }}
-              className="mt-4 text-sm text-muted-foreground hover:underline"
-            >
-              Cancel
-            </button>
-          </div>
-        </div>
-      )}
     </div>
   );
 }

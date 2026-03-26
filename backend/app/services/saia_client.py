@@ -108,6 +108,7 @@ class SaiaClient:
         max_tokens: int | None = None,
         response_format: dict[str, Any] | None = None,
         deterministic: bool = False,
+        timeout_seconds: float | None = None,
     ) -> dict[str, Any]:
         if deterministic:
             temperature = 0.0
@@ -131,8 +132,14 @@ class SaiaClient:
         if response_format is not None:
             payload["response_format"] = response_format
 
+        client = self._client
+        if timeout_seconds is not None:
+            with_options = getattr(self._client, "with_options", None)
+            if callable(with_options):
+                client = with_options(timeout=float(timeout_seconds))
+
         try:
-            response = self._client.chat.completions.create(**payload)
+            response = client.chat.completions.create(**payload)
         except Exception as exc:
             lowered = str(exc).lower()
             if deterministic and (
@@ -142,7 +149,7 @@ class SaiaClient:
                 or "unexpected keyword" in lowered
             ):
                 payload.pop("extra_body", None)
-                response = self._client.chat.completions.create(**payload)
+                response = client.chat.completions.create(**payload)
             else:
                 raise
         choices = list(getattr(response, "choices", []) or [])

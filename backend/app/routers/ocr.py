@@ -48,6 +48,7 @@ from app.db.pipeline_db import (
     table_view_for_events,
     table_view_for_ocr_backend_results,
     table_view_for_run,
+    upsert_evidence_span,
     update_run_fields,
 )
 from app.routers.predict import _prepare_image_for_segmentation
@@ -62,6 +63,12 @@ from app.schemas.agents_ocr import (
     SaiaOCRResponse,
 )
 from app.config import settings as _app_settings
+from app.services.glm_ollama_ocr import (
+    GlmOllamaOcrError,
+    GlmOllamaOcrResult,
+    build_glm_ocr_prompt,
+    run_glm_ollama_ocr,
+)
 from app.services.saia_client import SaiaConfigError
 from app.services.lexicon_trust import lexical_plausibility as _lexical_plausibility
 from app.services.ocr_quality import (
@@ -163,6 +170,29 @@ def _run_authority_linking_stage(run_id: str) -> dict[str, Any] | None:
     except Exception as exc:  # noqa: BLE001
         log_event(run_id, "AUTHORITY_LINKING_ERROR", "ERROR", f"Authority linking failed: {exc}")
         return None
+
+
+def _persist_deferred_authority_links(
+    run_id: str,
+    *,
+    reason: str,
+) -> tuple[dict[str, Any] | None, str | None]:
+    try:
+        from app.services.authority_linking import build_linking_report_from_db, persist_unresolved_mentions
+
+        log_event(run_id, "AUTHORITY_LINKING_DEFERRED", "START", reason)
+        result = persist_unresolved_mentions(run_id, reason=reason)
+        report = build_linking_report_from_db(run_id) if result.get("mentions_total") else None
+        log_event(
+            run_id,
+            "AUTHORITY_LINKING_DEFERRED",
+            "END",
+            f"Deferred linking stored unresolved mentions: total={result.get('mentions_total', 0)}",
+        )
+        return result, report
+    except Exception as exc:  # noqa: BLE001
+        log_event(run_id, "AUTHORITY_LINKING_ERROR", "ERROR", f"Deferred authority persistence failed: {exc}")
+        return None, None
 
 _TEXT_LABEL_INCLUDE_TOKENS = (
     "main script",
@@ -281,6 +311,28 @@ _LATIN_STRONG_ANCHORS = {
 _MENTION_TOKEN_RE = re.compile(r"[A-Za-zÀ-ÖØ-öø-ÿ][A-Za-zÀ-ÖØ-öø-ÿ'’\-]*")
 _PERSON_PARTICLES = {"de", "d'", "d’", "du", "des"}
 _PLACE_ANCHORS = {"lausanne", "paris", "lyon", "rome", "avignon", "geneve", "genève"}
+_WEAK_PLACE_LEXICAL_BLACKLIST = {
+    "enfant",
+    "enfans",
+    "enfants",
+    "vilanie",
+    "vilenie",
+    "villanie",
+    "amor",
+    "amour",
+    "courtoisie",
+    "felonie",
+    "honte",
+    "honor",
+    "honneur",
+    "merci",
+    "paor",
+    "peor",
+    "peur",
+    "proece",
+    "proesce",
+    "chevalerie",
+}
 _TITLE_ANCHORS = {"euesque", "évesque", "evesque", "prince", "chapellain", "pere"}
 _DATE_PATTERNS = (
     re.compile(r"\b(?:l['’]an|lan|an de grace)\b(?:\s+[A-Za-z0-9IVXLCDM]+){0,4}", re.IGNORECASE),
@@ -939,6 +991,17 @@ def _extract_salvage_mentions(base_text: str) -> tuple[list[dict[str, Any]], dic
                 "dist": 0,
                 "max_dist": 0,
                 "reason": f"editorial_blacklist: '{tok_low_val}' is not an entity",
+            })
+            continue
+        if tok_low_val in _WEAK_PLACE_LEXICAL_BLACKLIST:
+            debug["rejected"].append({
+                "surface": tok_text,
+                "start_offset": next_tok_m.start(),
+                "end_offset": next_tok_m.end(),
+                "canonical": "(place)",
+                "dist": 0,
+                "max_dist": 0,
+                "reason": f"weak_place_lexical_blacklist: '{tok_low_val}' is lexical, not a place candidate",
             })
             continue
         # Require length >= 5, alpha-only after norm, and not a stopword
@@ -1643,6 +1706,22 @@ def _run_trace_analysis(
     clear_analysis_for_run(run_id)
     chunks_input = _build_line_chunks(base_text)
     chunk_rows = insert_chunks(run_id, chunks_input)
+    run_record = get_run(run_id) or {}
+    asset_ref = str(run_record.get("asset_ref") or "").strip()
+    for chunk in chunk_rows:
+        upsert_evidence_span(
+            {
+                "run_id": run_id,
+                "asset_ref": asset_ref,
+                "page_id": asset_ref or None,
+                "chunk_id": chunk.get("chunk_id"),
+                "start_offset": chunk.get("start_offset"),
+                "end_offset": chunk.get("end_offset"),
+                "raw_text": chunk.get("text"),
+                "normalized_text": str(chunk.get("text") or "").strip(),
+                "meta_json": {"source": "ocr_chunk", "chunk_idx": chunk.get("idx")},
+            }
+        )
 
     mentions_input, candidate_input, salvage_debug = _extract_mentions_from_text(base_text)
     for mention in mentions_input:
@@ -2686,6 +2765,208 @@ def _full_page_response_from_comparison_summary(
     )
 
 
+def _full_page_response_from_glm_ollama_result(
+    result: GlmOllamaOcrResult,
+    payload: SaiaFullPageExtractRequest,
+) -> SaiaFullPageExtractResponse:
+    warnings = list(result.warnings)
+    if payload.compare_backends:
+        warnings.append("COMPARE_BACKENDS_IGNORED")
+    fallbacks_used = [
+        warning.split(":", 1)[1]
+        for warning in warnings
+        if warning.startswith("OCR_VARIANT_FALLBACK:")
+    ]
+    if result.attempts_used > 1:
+        fallbacks_used.append(f"retry_attempt:{result.attempts_used}")
+    summary = OCRComparisonSummary(
+        backend_name="glmocr",
+        model_name=result.model_used,
+        selected=True,
+        text=result.text,
+        lines=list(result.lines),
+        confidence=None,
+        warnings=warnings,
+        language_hint=payload.language_hint or (payload.metadata.language if payload.metadata else None),
+        script_family=payload.metadata.script_family if payload.metadata else None,
+        notes=[
+            f"processed_variant={result.processed_variant_name}",
+            f"processed_dimensions={result.processed_width}x{result.processed_height}",
+            f"processed_size_bytes={result.processed_size_bytes}",
+        ],
+    )
+    response = _full_page_response_from_comparison_summary(summary, payload)
+    return response.model_copy(
+        update={
+            "fallbacks_used": fallbacks_used,
+            "warnings": warnings,
+            "original_image_size_bytes": result.original_size_bytes,
+            "original_image_width": result.original_width,
+            "original_image_height": result.original_height,
+            "processed_image_size_bytes": result.processed_size_bytes,
+            "processed_image_width": result.processed_width,
+            "processed_image_height": result.processed_height,
+            "preprocessing_applied": result.preprocessing_applied,
+            "processed_variant_name": result.processed_variant_name,
+            "ocr_attempts_used": result.attempts_used,
+        }
+    )
+
+
+def _run_post_ocr_pipeline_for_glm(
+    payload: SaiaFullPageExtractRequest,
+    response: SaiaFullPageExtractResponse,
+    image_bytes: bytes,
+) -> dict[str, Any]:
+    text_value = str(response.text or "").strip()
+    if not text_value:
+        return {}
+
+    asset_ref = (
+        str(payload.page_id or "").strip()
+        or str(payload.image_id or "").strip()
+        or str(payload.document_id or "").strip()
+        or "inline:image_b64"
+    )
+    asset_sha256 = hashlib.sha256(image_bytes).hexdigest()
+    run_id = create_run(asset_ref=asset_ref, asset_sha256=asset_sha256)
+    log_event(run_id, "RECEIVED", "START", "GLM full-page OCR run received.")
+    log_event(run_id, "OCR_RUNNING", "START", "Running GLM full-page OCR post-processing pipeline.")
+    update_run_fields(run_id, status="RUNNING", current_stage="OCR_RUNNING")
+
+    confidence_value = float(response.confidence or 0.0)
+    raw_lines = list(response.lines or [line for line in text_value.splitlines() if line.strip()])
+    quality_report = compute_quality_report(text_value, run_id=run_id, pass_idx=0)
+    quality_label = quality_report.quality_label
+    insert_ocr_quality_report(run_id, quality_report.to_dict())
+    lex_lang = response.detected_language if response.detected_language != "unknown" else ""
+    lex_score = _lexical_plausibility(text_value, lex_lang) if lex_lang else None
+    gate_decisions = enforce_quality_gates(quality_report, run_id=run_id, lexical_plausibility=lex_score)
+    downstream_mode = gate_decisions["downstream_mode"]
+    effective_quality = build_effective_quality(quality_report, gate_decisions, confidence=confidence_value)
+
+    update_run_fields(
+        run_id,
+        current_stage="OCR_DONE",
+        script_hint=response.script_hint,
+        detected_language=response.detected_language,
+        confidence=response.confidence,
+        warnings_json=json.dumps(
+            {
+                "warnings": list(response.warnings),
+                "quality_label": quality_label,
+                "quality_label_v2": quality_label,
+                "ocr_backend": "glmocr",
+            },
+            ensure_ascii=False,
+        ),
+        ocr_lines_json=json.dumps(raw_lines, ensure_ascii=False),
+        ocr_text=text_value,
+        proofread_text=text_value,
+    )
+    log_event(run_id, "OCR_DONE", "END", "GLM full-page OCR text stored.")
+
+    if not gate_decisions.get("ner_allowed", True):
+        log_event(
+            run_id,
+            "ANALYZE_DEGRADED",
+            "INFO",
+            f"NER gate blocked full analysis; running degraded mention capture only (quality={quality_label})",
+        )
+        update_run_fields(run_id, current_stage="ANALYZE_RUNNING")
+        chunks, mentions, _candidates, salvage_debug = _run_trace_analysis(run_id, text_value)
+        salvage_debug = dict(salvage_debug or {})
+        salvage_debug["degraded_mode"] = True
+        salvage_debug["reason"] = "ner_not_allowed_degraded_capture"
+        chunks_count = len(chunks)
+        mentions_count = len(mentions)
+        mention_report = _build_mention_extraction_report(
+            run_id,
+            asset_ref,
+            mentions,
+            salvage_debug,
+        ) if mentions or not salvage_debug.get("skipped") else None
+        update_run_fields(
+            run_id,
+            current_stage="ANALYZE_DONE",
+            base_text_source="proofread",
+            chunks_count=chunks_count,
+            mentions_count=mentions_count,
+        )
+        log_event(run_id, "ANALYZE_DONE", "END", f"degraded_capture chunks={chunks_count}, mentions={mentions_count}")
+    else:
+        log_event(run_id, "ANALYZE_RUNNING", "START", "Running chunk/entity analysis.")
+        update_run_fields(run_id, current_stage="ANALYZE_RUNNING")
+        chunks, mentions, _candidates, salvage_debug = _run_trace_analysis(run_id, text_value)
+        chunks_count = len(chunks)
+        mentions_count = len(mentions)
+        mention_report = _build_mention_extraction_report(
+            run_id,
+            asset_ref,
+            mentions,
+            salvage_debug,
+        ) if mentions or not salvage_debug.get("skipped") else None
+        mention_recall = check_mention_recall(text_value, mentions_count, quality_label)
+        if not mention_recall["mention_recall_ok"]:
+            log_event(run_id, "QUALITY_GATES", "INFO", mention_recall["reason"])
+        update_run_fields(
+            run_id,
+            current_stage="ANALYZE_DONE",
+            base_text_source="proofread",
+            chunks_count=chunks_count,
+            mentions_count=mentions_count,
+        )
+        log_event(run_id, "ANALYZE_DONE", "END", f"chunks={chunks_count}, mentions={mentions_count}")
+
+    log_event(run_id, "STORED", "END", "Run results persisted in SQLite.")
+    update_run_fields(run_id, current_stage="STORED", proofread_text=text_value)
+
+    authority_report: str | None = None
+    if not gate_decisions.get("token_search_allowed", True):
+        log_event(run_id, "LINKING_SKIPPED", "INFO", f"Authority linking SKIPPED: token_search_allowed=False (quality={quality_label})")
+        linking_result, authority_report = _persist_deferred_authority_links(
+            run_id,
+            reason=f"token_search_allowed=False quality={quality_label}",
+        )
+    else:
+        linking_result = _run_authority_linking_stage(run_id)
+        if mentions_count:
+            try:
+                from app.services.authority_linking import build_linking_report_from_db
+
+                authority_report = build_linking_report_from_db(run_id)
+            except Exception:
+                authority_report = None
+
+    consolidated_report = _build_consolidated_report(
+        run_id,
+        asset_ref,
+        mentions,
+        salvage_debug,
+        linking_result,
+    ) if mentions_count or linking_result else None
+
+    if not gate_decisions.get("token_search_allowed", True):
+        log_event(run_id, "INDEX_SKIPPED", "INFO", f"RAG auto-index SKIPPED: token_search_allowed=False (quality={quality_label})")
+    else:
+        _auto_index_run(run_id)
+
+    log_event(run_id, "DONE", "END", "GLM full-page pipeline completed successfully.")
+    update_run_fields(run_id, status="COMPLETED", current_stage="DONE", error=None)
+
+    return {
+        "run_id": run_id,
+        "quality_label": quality_label,
+        "downstream_mode": downstream_mode,
+        "chunks_count": chunks_count,
+        "mentions_count": mentions_count,
+        "authority_report": authority_report,
+        "mention_report": mention_report,
+        "consolidated_report": consolidated_report,
+        "warnings": [],
+    }
+
+
 def _build_comparison_runs(result: OCRExtractResponse, requested_backend: str) -> list[OCRComparisonSummary]:
     order_map = {
         region.region_id: int(region.reading_order if region.reading_order is not None else index)
@@ -2994,13 +3275,29 @@ async def _run_segmented_trace_pipeline(
     )
 
     if not gate_decisions.get("ner_allowed", True):
-        log_event(run_id, "ANALYZE_SKIPPED", "INFO", f"NER/analysis SKIPPED: ner_allowed=False (quality={hardened_quality_label})")
-        update_run_fields(run_id, current_stage="ANALYZE_SKIPPED")
-        chunks: list[dict[str, Any]] = []
-        mentions: list[dict[str, Any]] = []
-        salvage_debug: dict[str, Any] = {"skipped": True, "reason": "ner_not_allowed"}
-        chunks_count = 0
-        mentions_count = 0
+        log_event(
+            run_id,
+            "ANALYZE_DEGRADED",
+            "INFO",
+            f"NER gate blocked full analysis; running degraded mention capture only (quality={hardened_quality_label})",
+        )
+        update_run_fields(run_id, current_stage="ANALYZE_RUNNING")
+        base_text_source = "proofread" if proofread_text.strip() else "ocr"
+        base_text = proofread_text if base_text_source == "proofread" else raw_text
+        chunks, mentions, _candidates, salvage_debug = _run_trace_analysis(run_id, base_text)
+        salvage_debug = dict(salvage_debug or {})
+        salvage_debug["degraded_mode"] = True
+        salvage_debug["reason"] = "ner_not_allowed_degraded_capture"
+        chunks_count = len(chunks)
+        mentions_count = len(mentions)
+        update_run_fields(
+            run_id,
+            current_stage="ANALYZE_DONE",
+            base_text_source=base_text_source,
+            chunks_count=chunks_count,
+            mentions_count=mentions_count,
+        )
+        log_event(run_id, "ANALYZE_DONE", "END", f"degraded_capture chunks={chunks_count}, mentions={mentions_count}")
     else:
         log_event(run_id, "ANALYZE_RUNNING", "START", "Running chunk/entity analysis.")
         update_run_fields(run_id, current_stage="ANALYZE_RUNNING")
@@ -3053,7 +3350,7 @@ async def _run_segmented_trace_pipeline(
     else:
         mention_recall = {
             "mention_recall_ok": True,
-            "reason": "NER skipped (ner_allowed=False)",
+            "reason": "Degraded mention capture only (ner_allowed=False)",
             "trigger_high_recall": False,
         }
 
@@ -3062,7 +3359,10 @@ async def _run_segmented_trace_pipeline(
 
     if not gate_decisions.get("token_search_allowed", True):
         log_event(run_id, "LINKING_SKIPPED", "INFO", f"Authority linking SKIPPED: token_search_allowed=False (quality={hardened_quality_label})")
-        linking_result = None
+        linking_result, _authority_report = _persist_deferred_authority_links(
+            run_id,
+            reason=f"token_search_allowed=False quality={hardened_quality_label}",
+        )
     else:
         linking_result = _run_authority_linking_stage(run_id)
 
@@ -3124,127 +3424,96 @@ async def ocr_extract(
 @router.post("/ocr/saia", response_model=SaiaOCRResponse)
 async def ocr_saia(payload: SaiaOCRRequest) -> SaiaOCRResponse:
     try:
-        return _get_saia_ocr_agent().extract(payload)
+        full_page_payload = SaiaFullPageExtractRequest(
+            image_id=payload.image_id,
+            page_id=payload.page_id,
+            image_b64=payload.image_b64,
+            script_hint_seed=payload.script_hint_seed,
+            apply_proofread=payload.apply_proofread,
+            location_suggestions=list(payload.location_suggestions),
+            ocr_backend="glmocr",
+        )
+        response = await ocr_extract_full_page(full_page_payload)
+        return SaiaOCRResponse(
+            status="FAIL" if response.status == "EMPTY" else response.status,
+            model_used=response.model_used,
+            fallbacks=[],
+            fallbacks_used=list(response.fallbacks_used),
+            warnings=list(response.warnings),
+            lines=list(response.lines),
+            text=response.text,
+            script_hint=response.script_hint,
+            detected_language=response.detected_language,
+            confidence=float(response.confidence or 0.0),
+            raw_json={
+                "status": response.status,
+                "model_used": response.model_used,
+                "warnings": list(response.warnings),
+                "lines": list(response.lines),
+                "text": response.text,
+                "script_hint": response.script_hint,
+                "detected_language": response.detected_language,
+                "confidence": response.confidence,
+                "processed_image_size_bytes": response.processed_image_size_bytes,
+                "processed_image_width": response.processed_image_width,
+                "processed_image_height": response.processed_image_height,
+            },
+        )
+    except HTTPException:
+        raise
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
-    except SaiaConfigError as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
-    except SaiaOCRAgentError as exc:
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    except GlmOllamaOcrError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
     except Exception as exc:  # pragma: no cover
-        raise HTTPException(status_code=500, detail=f"SAIA OCR failed: {exc}") from exc
+        raise HTTPException(status_code=500, detail=f"GLM OCR failed: {exc}") from exc
 
 
 @router.post("/ocr/extract_full_page", response_model=SaiaFullPageExtractResponse)
 async def ocr_extract_full_page(payload: SaiaFullPageExtractRequest) -> SaiaFullPageExtractResponse:
-    base_warnings: list[str] = []
-    requested_backend = str(payload.ocr_backend or "auto").strip().lower()
-    if requested_backend == "saia":
-        requested_backend = "auto"
-    effective_payload = payload.model_copy(
-        update={
-            "ocr_backend": requested_backend,
-            "compare_backends": [backend for backend in payload.compare_backends if backend != "saia"],
-        }
-    )
-
     try:
-        image_bytes = decode_image_bytes(effective_payload.image_b64 or "")
+        image_bytes = decode_image_bytes(payload.image_b64 or "")
     except Exception as exc:
         raise HTTPException(status_code=422, detail=f"Invalid image_b64 payload: {exc}") from exc
 
-    location_suggestions = list(effective_payload.location_suggestions)
-    regions = list(effective_payload.regions)
-    if not location_suggestions and not regions:
-        try:
-            detected_regions = await asyncio.to_thread(_run_segmentation_for_regions, image_bytes)
-            location_suggestions = _extract_location_suggestions(
-                {
-                    "annotations": [
-                        {"id": region.region_id, "bbox": [region.bbox_xyxy[0], region.bbox_xyxy[1], region.bbox_xyxy[2] - region.bbox_xyxy[0], region.bbox_xyxy[3] - region.bbox_xyxy[1]], "category_id": idx + 1}
-                        for idx, region in enumerate(detected_regions)
-                        if region.bbox_xyxy is not None
-                    ],
-                    "categories": [{"id": idx + 1, "name": region.label or "Main script black"} for idx, region in enumerate(detected_regions)],
-                }
-            )
-            regions = detected_regions
-        except Exception as exc:
-            base_warnings.append(f"SEGMENTATION_FAILED:{exc}")
-    elif not regions and location_suggestions:
-        regions = _regions_from_location_suggestions(location_suggestions)
-
-    if not regions:
-        return SaiaFullPageExtractResponse(
-            status="EMPTY",
-            model_used=requested_backend if requested_backend != "auto" else "kraken_auto",
-            fallbacks_used=[],
-            detected_language=_normalize_detected_language(str(effective_payload.language_hint or "unknown")),
-            language_confidence=None,
-            script_hint=_map_extract_script_hint_to_full_page(effective_payload.script_hint_seed),  # type: ignore[arg-type]
-            confidence=0.0,
-            warnings=base_warnings,
-            lines=[],
-            text="",
-            fallbacks=[],
-            comparison_runs=[],
-        )
-
-    glm_requested = requested_backend == "glmocr"
-    glm_compare_requested = "glmocr" in effective_payload.compare_backends
-    structured_compare_backends = [backend for backend in effective_payload.compare_backends if backend != "glmocr"]
-
-    if glm_requested:
-        return _full_page_response_from_comparison_summary(
-            _run_glmocr_full_page_summary(effective_payload, image_bytes, regions, selected=True),
-            effective_payload,
-        )
+    glm_prompt = build_glm_ocr_prompt(
+        language_hint=payload.language_hint,
+        script_hint_seed=payload.script_hint_seed,
+        metadata=payload.metadata,
+    )
 
     try:
-        extract_result_any = await asyncio.to_thread(
-            _get_ocr_agent().run,
-            _build_segmented_extract_request(
-                effective_payload.model_copy(
-                    update={
-                        "regions": regions,
-                        "location_suggestions": location_suggestions,
-                        "compare_backends": structured_compare_backends,
-                    }
-                ),
-                regions,
+        result = await asyncio.to_thread(
+            run_glm_ollama_ocr,
+            image_bytes,
+            image_ref=(
+                str(payload.page_id or "").strip()
+                or str(payload.image_id or "").strip()
+                or str(payload.document_id or "").strip()
+                or "inline:image_b64"
             ),
+            prompt=glm_prompt,
         )
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
-    except SaiaConfigError as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
-    except OCRAgentError as exc:
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    except GlmOllamaOcrError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
     except Exception as exc:  # pragma: no cover
         raise HTTPException(status_code=500, detail=f"Full-page OCR failed: {exc}") from exc
 
-    if not isinstance(extract_result_any, OCRExtractResponse):
-        raise HTTPException(status_code=500, detail="Unexpected segmented OCR response.")
-    structured_response = _full_page_response_from_extract(extract_result_any)
-    comparison_runs = _build_comparison_runs(extract_result_any, requested_backend)
-    if glm_compare_requested:
-        comparison_runs.append(
-            _run_glmocr_full_page_summary(effective_payload, image_bytes, regions, selected=False)
+    response = _full_page_response_from_glm_ollama_result(result, payload)
+    try:
+        pipeline_fields = await asyncio.to_thread(
+            _run_post_ocr_pipeline_for_glm,
+            payload,
+            response,
+            image_bytes,
         )
-    structured_response = structured_response.model_copy(update={"comparison_runs": comparison_runs})
-    if base_warnings:
-        merged_warnings = list(dict.fromkeys([*base_warnings, *structured_response.warnings]))
-        structured_response = structured_response.model_copy(
-            update={
-                "warnings": merged_warnings,
-                "status": _resolve_full_page_status(
-                    text=structured_response.text,
-                    confidence=structured_response.confidence,
-                    warnings=merged_warnings,
-                ),
-            }
-        )
-    return structured_response
+    except Exception as exc:  # pragma: no cover
+        pipeline_fields = {"warnings": [f"POST_OCR_PIPELINE_FAILED:{exc}"]}
+
+    merged_warnings = list(dict.fromkeys([*list(response.warnings), *list(pipeline_fields.pop("warnings", []) or [])]))
+    return response.model_copy(update={**pipeline_fields, "warnings": merged_warnings})
 
 
 # ── Quality label ranking helper ──────────────────────────────────────
@@ -3962,15 +4231,31 @@ async def ocr_page_with_trace(payload: SaiaFullPageExtractRequest) -> dict[str, 
         # DOWNSTREAM: ANALYZE (check ner_allowed)
         # ══════════════════════════════════════════════════════════════
         if not gate_decisions.get("ner_allowed", True):
-            log_event(run_id, "ANALYZE_SKIPPED", "INFO",
-                      f"NER/analysis SKIPPED: ner_allowed=False "
-                      f"(quality={hardened_quality_label})")
-            update_run_fields(run_id, current_stage="ANALYZE_SKIPPED")
-            chunks: list[dict[str, Any]] = []
-            mentions: list[dict[str, Any]] = []
-            salvage_debug: dict[str, Any] = {"skipped": True, "reason": "ner_not_allowed"}
-            chunks_count = 0
-            mentions_count = 0
+            log_event(
+                run_id,
+                "ANALYZE_DEGRADED",
+                "INFO",
+                f"NER gate blocked full analysis; running degraded mention capture only "
+                f"(quality={hardened_quality_label})",
+            )
+            update_run_fields(run_id, current_stage="ANALYZE_RUNNING")
+            base_text_source = "proofread" if str(proofread_text or "").strip() else "ocr"
+            base_text = str(proofread_text or "").strip() if base_text_source == "proofread" else str(ocr_payload["text"] or "")
+            chunks, mentions, _candidates, salvage_debug = _run_trace_analysis(run_id, base_text)
+            salvage_debug = dict(salvage_debug or {})
+            salvage_debug["degraded_mode"] = True
+            salvage_debug["reason"] = "ner_not_allowed_degraded_capture"
+            chunks_count = len(chunks)
+            mentions_count = len(mentions)
+            update_run_fields(
+                run_id,
+                current_stage="ANALYZE_DONE",
+                base_text_source=base_text_source,
+                chunks_count=chunks_count,
+                mentions_count=mentions_count,
+            )
+            log_event(run_id, "ANALYZE_DONE", "END",
+                      f"degraded_capture chunks={chunks_count}, mentions={mentions_count}")
         else:
             log_event(run_id, "ANALYZE_RUNNING", "START",
                       "Running chunk/entity analysis.")
@@ -4048,7 +4333,7 @@ async def ocr_page_with_trace(payload: SaiaFullPageExtractRequest) -> dict[str, 
         else:
             mention_recall = {
                 "mention_recall_ok": True,
-                "reason": "NER skipped (ner_allowed=False)",
+                "reason": "Degraded mention capture only (ner_allowed=False)",
                 "trigger_high_recall": False,
             }
 
@@ -4062,7 +4347,10 @@ async def ocr_page_with_trace(payload: SaiaFullPageExtractRequest) -> dict[str, 
             log_event(run_id, "LINKING_SKIPPED", "INFO",
                       f"Authority linking SKIPPED: token_search_allowed=False "
                       f"(quality={hardened_quality_label})")
-            linking_result = None
+            linking_result, _authority_report = _persist_deferred_authority_links(
+                run_id,
+                reason=f"token_search_allowed=False quality={hardened_quality_label}",
+            )
         else:
             linking_result = _run_authority_linking_stage(run_id)
 

@@ -28,15 +28,19 @@ import json
 import logging
 import time
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
 
 from app.db import pipeline_db
 from app.services.entity_scoring import (
+    context_similarity,
     compute_score,
     disambiguate,
     get_thresholds,
     rescore_with_canonical,
+    string_similarity,
 )
+from app.services.authority_sources import search_geonames, search_viaf
 from app.services.wikidata_client import (
     enrich_wikidata_item,
     is_type_compatible,
@@ -52,6 +56,688 @@ from app.services.text_normalization import (
 )
 
 log = logging.getLogger("archai.authority_linking")
+
+
+def _fetch_viaf_profile(viaf_id: str) -> dict[str, Any]:
+    viaf_id = str(viaf_id or "").strip()
+    if not viaf_id:
+        return {"aliases": [], "source_url": ""}
+
+    import urllib.error
+    import urllib.request
+
+    source_url = f"https://viaf.org/viaf/{viaf_id}/viaf.json"
+    request = urllib.request.Request(source_url, headers={"User-Agent": "Archai-OCR-Pipeline/1.0"})
+    try:
+        with urllib.request.urlopen(request, timeout=10) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        log.debug("VIAF HTTP error for %s: %s", viaf_id, exc)
+        return {"aliases": [], "source_url": source_url}
+    except Exception as exc:  # noqa: BLE001
+        log.debug("VIAF lookup failed for %s: %s", viaf_id, exc)
+        return {"aliases": [], "source_url": source_url}
+
+    aliases: list[dict[str, str]] = []
+    seen: set[str] = set()
+    main_headings = payload.get("mainHeadings", {}).get("data", [])
+    if isinstance(main_headings, dict):
+        main_headings = [main_headings]
+    for item in main_headings if isinstance(main_headings, list) else []:
+        if not isinstance(item, dict):
+            continue
+        value = str(item.get("text") or "").strip()
+        if not value:
+            continue
+        key = value.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        aliases.append({"lang": "", "value": value})
+
+    return {
+        "aliases": aliases,
+        "source_url": source_url,
+        "name_type": str(payload.get("nameType") or "").strip(),
+        "titles": payload.get("titles"),
+    }
+
+
+def _clear_structured_links_for_run(run_id: str) -> None:
+    pipeline_db._init_db_if_needed()
+    with pipeline_db._connect() as conn:
+        conn.execute(
+            """
+            DELETE FROM mention_links
+            WHERE mention_id IN (
+                SELECT mention_id FROM entity_mentions WHERE run_id=?
+            )
+            """,
+            (run_id,),
+        )
+        conn.execute(
+            """
+            DELETE FROM evidence_spans
+            WHERE run_id=? AND mention_id IS NOT NULL
+            """,
+            (run_id,),
+        )
+        conn.commit()
+
+
+def _score_breakdown_for_mention(
+    *,
+    mention: dict[str, Any],
+    query_details: list[dict[str, Any]],
+    name_likeness: float,
+    canonical_match: dict[str, Any] | None,
+    selected: dict[str, Any] | None,
+    top_candidates: list[dict[str, Any]],
+    ocr_quality: str,
+    status: str,
+    reason: str,
+) -> dict[str, Any]:
+    return {
+        "mention_surface": str(mention.get("surface") or ""),
+        "mention_confidence": float(mention.get("confidence", 0.0)),
+        "ent_type": str(mention.get("ent_type") or "unknown"),
+        "status": status,
+        "reason": reason,
+        "ocr_quality": ocr_quality,
+        "name_likeness": name_likeness,
+        "canonical_match": canonical_match,
+        "query_details": query_details,
+        "selected_candidate": selected,
+        "top_candidates": top_candidates,
+    }
+
+
+def _persist_mention_link(
+    *,
+    run_id: str,
+    asset_ref: str,
+    mention: dict[str, Any],
+    evidence_text: str,
+    evidence_span_id: str | None,
+    status: str,
+    reason: str,
+    score_breakdown: dict[str, Any],
+    selected: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    entity_id = _selected_entity_id(selected)
+    return pipeline_db.upsert_mention_link(
+        {
+            "mention_id": mention.get("mention_id"),
+            "entity_id": entity_id,
+            "confidence": selected.get("score") if selected else mention.get("confidence"),
+            "link_status": status,
+            "selected_by": "authority_linking.v3",
+            "type_compatible": selected.get("type_compatible") if selected else None,
+            "score_breakdown_json": score_breakdown,
+            "evidence_span_id": evidence_span_id,
+            "reason": reason,
+        }
+    )
+
+
+def _is_unresolved_status(status: str) -> bool:
+    return str(status or "").strip().lower().startswith("unresolved")
+
+
+def persist_unresolved_mentions(
+    run_id: str,
+    *,
+    reason: str,
+    status: str = "unresolved_low_quality",
+    selected_by: str = "authority_linking.deferred",
+) -> dict[str, Any]:
+    run = pipeline_db.get_run(run_id)
+    base_text = str(run.get("proofread_text") or run.get("ocr_text") or "") if run else ""
+    asset_ref = str(run.get("asset_ref") or "") if run else ""
+    mentions = pipeline_db.list_entity_mentions(run_id)
+    if not mentions:
+        empty = _empty_result(run_id, "no mentions found")
+        empty["_base_text"] = base_text
+        empty["asset_ref"] = asset_ref
+        return empty
+
+    ocr_quality = text_quality_label(base_text) if base_text else "LOW"
+    mention_results: list[dict[str, Any]] = []
+    type_counts = Counter(str(mention.get("ent_type", "unknown")) for mention in mentions)
+
+    for mention in mentions:
+        mention_id = str(mention.get("mention_id") or "")
+        surface = str(mention.get("surface") or "")
+        ent_type = str(mention.get("ent_type") or "unknown")
+        chunk_id = mention.get("chunk_id")
+        start_off = int(mention.get("start_offset", 0))
+        end_off = int(mention.get("end_offset", 0))
+        evidence_text = base_text[start_off:end_off] if base_text and end_off <= len(base_text) else surface
+        evidence_context = _mention_context_window(base_text, start_off, end_off) if base_text else evidence_text
+        mention_reason = _deferred_reason_for_mention(surface, ent_type, evidence_context or evidence_text, reason)
+        evidence_span = pipeline_db.upsert_evidence_span(
+            {
+                "run_id": run_id,
+                "asset_ref": asset_ref,
+                "page_id": asset_ref or None,
+                "chunk_id": chunk_id,
+                "mention_id": mention_id,
+                "start_offset": start_off,
+                "end_offset": end_off,
+                "raw_text": evidence_text,
+                "normalized_text": normalize_for_search(evidence_text) if evidence_text else "",
+                "meta_json": {
+                    "source": "authority_linking.deferred",
+                    "ent_type": ent_type,
+                    "surface": surface,
+                    "reason": mention_reason,
+                },
+            }
+        )
+        score_breakdown = _score_breakdown_for_mention(
+            mention=mention,
+            query_details=[],
+            name_likeness=0.0,
+            canonical_match=None,
+            selected=None,
+            top_candidates=[],
+            ocr_quality=ocr_quality,
+            status=status,
+            reason=mention_reason,
+        )
+        pipeline_db.upsert_mention_link(
+            {
+                "mention_id": mention_id,
+                "entity_id": None,
+                "confidence": min(float(mention.get("confidence", 0.0)), 0.35),
+                "link_status": status,
+                "selected_by": selected_by,
+                "type_compatible": None,
+                "score_breakdown_json": score_breakdown,
+                "evidence_span_id": evidence_span.get("span_id"),
+                "reason": mention_reason,
+            }
+        )
+        mention_results.append(
+            {
+                "mention_id": mention_id,
+                "surface": surface,
+                "ent_type": ent_type,
+                "chunk_id": chunk_id,
+                "start_offset": start_off,
+                "end_offset": end_off,
+                "evidence_text": evidence_text,
+                "queries_attempted": [],
+                "query_details": [],
+                "status": status,
+                "reason": mention_reason,
+                "name_likeness": None,
+                "canonical_match": None,
+                "selected": None,
+                "top_candidates": [],
+            }
+        )
+
+    return {
+        "run_id": run_id,
+        "asset_ref": asset_ref,
+        "mentions_total": len(mentions),
+        "type_counts": dict(type_counts),
+        "candidates_total": 0,
+        "source_counts": {},
+        "linked_total": 0,
+        "unresolved_total": len(mentions),
+        "ambiguous_total": 0,
+        "skipped_total": 0,
+        "quality_skipped": len(mentions),
+        "canonical_matched": 0,
+        "type_mismatch_count": 0,
+        "api_calls_search": 0,
+        "api_calls_viaf": 0,
+        "api_calls_geonames": 0,
+        "api_calls_get": 0,
+        "api_calls": 0,
+        "cache_hits": 0,
+        "took_ms": 0,
+        "ocr_quality": ocr_quality,
+        "mention_results": mention_results,
+        "_base_text": base_text,
+    }
+
+
+def _selected_entity_id(selected: dict[str, Any] | None) -> str | None:
+    if not selected:
+        return None
+    source = str(selected.get("source") or ("wikidata" if selected.get("qid") else "")).strip()
+    authority_id = str(
+        selected.get("authority_id")
+        or selected.get("qid")
+        or selected.get("viaf_id")
+        or selected.get("geonames_id")
+        or ""
+    ).strip()
+    if not source or not authority_id:
+        return None
+    return f"{source}:{authority_id}"
+
+
+def _score_candidate(
+    *,
+    mention: dict[str, Any],
+    candidate: dict[str, Any],
+    context: str,
+    canonical_norm: str,
+    domain_bonus: float,
+    type_ok: bool,
+    resolved_tokens: set[str],
+) -> tuple[float, dict[str, Any]]:
+    surface = str(mention.get("surface") or "")
+    candidate_label = str(candidate.get("label") or "")
+    compare_surface = canonical_norm or surface
+    label_similarity = string_similarity(compare_surface, candidate_label)
+
+    aliases_raw = list(candidate.get("aliases", []) or [])
+    alias_values = [str(item.get("value") or "").strip() for item in aliases_raw if isinstance(item, dict)]
+    alias_values = [value for value in alias_values if value]
+    alias_match_quality = max((string_similarity(compare_surface, alias) for alias in alias_values), default=0.0)
+
+    description_parts = [
+        str(candidate.get("description") or ""),
+        str(candidate.get("canonical_description") or ""),
+        str(candidate.get("parent_location") or ""),
+        " ".join(str(item) for item in list(candidate.get("titles") or [])[:5]),
+    ]
+    description_text = " ".join(part for part in description_parts if part).strip()
+    document_context_compatibility = context_similarity(context, description_text)
+
+    source = str(candidate.get("source") or "wikidata").strip() or "wikidata"
+    source_confidence = float(candidate.get("source_confidence") or {"wikidata": 1.0, "viaf": 0.92, "geonames": 0.95}.get(source, 0.8))
+
+    mention_label = str(mention.get("label") or "").lower()
+    segmentation_label_prior = 0.0
+    if source == "geonames" and mention.get("ent_type") == "place":
+        segmentation_label_prior = 0.04
+    elif source == "viaf" and mention.get("ent_type") in {"person", "work"}:
+        segmentation_label_prior = 0.03
+    elif mention_label.startswith("person") or mention_label.startswith("place") or mention_label.startswith("work"):
+        segmentation_label_prior = 0.02
+
+    cooccurrence_bonus = 0.0
+    if resolved_tokens:
+        haystack = " ".join(
+            [
+                candidate_label.lower(),
+                description_text.lower(),
+                str(candidate.get("country_name") or "").lower(),
+                str(candidate.get("admin1_name") or "").lower(),
+            ]
+        )
+        if any(token and token in haystack for token in resolved_tokens):
+            cooccurrence_bonus = 0.05
+
+    chronology_bonus = 0.0
+    if any(token in description_text.lower() for token in ("medieval", "arthurian", "saint", "abbey", "monastery", "diocese")):
+        chronology_bonus = 0.03
+
+    base_score = compute_score(
+        surface,
+        candidate_label,
+        context,
+        description_text,
+        type_compatible=type_ok,
+        canonical_norm=canonical_norm,
+        domain_bonus=domain_bonus,
+    )
+
+    final_score = (
+        base_score * 0.68
+        + alias_match_quality * 0.12
+        + document_context_compatibility * 0.08
+        + source_confidence * 0.06
+        + segmentation_label_prior
+        + cooccurrence_bonus
+        + chronology_bonus
+    )
+    final_score = max(0.0, min(1.0, round(final_score, 4)))
+
+    return final_score, {
+        "label_similarity": round(label_similarity, 4),
+        "alias_match_quality": round(alias_match_quality, 4),
+        "document_context_compatibility": round(document_context_compatibility, 4),
+        "source_confidence": round(source_confidence, 4),
+        "segmentation_label_prior": round(segmentation_label_prior, 4),
+        "cooccurrence_bonus": round(cooccurrence_bonus, 4),
+        "chronology_bonus": round(chronology_bonus, 4),
+        "domain_bonus": round(domain_bonus, 4),
+        "base_score": round(base_score, 4),
+        "final_score": final_score,
+    }
+
+
+def _search_all_sources_for_query(
+    query: str,
+    *,
+    ent_type: str,
+    top_k: int,
+    wikidata_mode: str,
+) -> tuple[dict[str, list[dict[str, Any]]], int, int, int]:
+    results: dict[str, list[dict[str, Any]]] = {"wikidata": [], "viaf": [], "geonames": []}
+    api_calls_search = 0
+    api_calls_viaf = 0
+    api_calls_geonames = 0
+
+    if wikidata_mode == "cache":
+        cached = cache_get("wikidata", query, max_age_hours=6.0) or []
+        results["wikidata"] = cached[:top_k]
+
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        futures: dict[Any, str] = {}
+        if wikidata_mode == "api":
+            futures[executor.submit(search_wikidata, query, k=top_k, force_refresh=True)] = "wikidata"
+        if ent_type in {"person", "work"}:
+            futures[executor.submit(search_viaf, query, k=top_k, ent_type=ent_type)] = "viaf"
+        if ent_type == "place":
+            futures[executor.submit(search_geonames, query, k=top_k, ent_type=ent_type)] = "geonames"
+
+        for future in as_completed(futures):
+            source = futures[future]
+            try:
+                payload = future.result() or []
+            except Exception as exc:  # noqa: BLE001
+                log.debug("authority source %s failed for %r: %s", source, query, exc)
+                payload = []
+            if source == "wikidata":
+                results["wikidata"] = payload
+                if wikidata_mode == "api":
+                    api_calls_search += 1
+            elif source == "viaf":
+                results["viaf"] = payload
+                api_calls_viaf += 1
+            elif source == "geonames":
+                results["geonames"] = payload
+                api_calls_geonames += 1
+
+    return results, api_calls_search, api_calls_viaf, api_calls_geonames
+
+
+def _candidate_source(candidate: dict[str, Any]) -> str:
+    source = str(candidate.get("source") or "").strip().lower()
+    if source:
+        return source
+    if candidate.get("qid"):
+        return "wikidata"
+    if candidate.get("viaf_id"):
+        return "viaf"
+    if candidate.get("geonames_id"):
+        return "geonames"
+    return "unknown"
+
+
+def _candidate_authority_id(candidate: dict[str, Any]) -> str:
+    return str(
+        candidate.get("authority_id")
+        or candidate.get("qid")
+        or candidate.get("viaf_id")
+        or candidate.get("geonames_id")
+        or candidate.get("label")
+        or ""
+    ).strip()
+
+
+def _candidate_identity_key(candidate: dict[str, Any]) -> str:
+    source = _candidate_source(candidate)
+    authority_id = _candidate_authority_id(candidate)
+    if authority_id:
+        return f"{source}:{authority_id}"
+    return f"{source}:{normalise_surface(str(candidate.get('label') or ''))}"
+
+
+def _merge_candidate(existing: dict[str, Any], incoming: dict[str, Any]) -> dict[str, Any]:
+    merged = dict(existing)
+    for key, value in incoming.items():
+        if key == "aliases":
+            aliases: list[dict[str, Any]] = []
+            seen: set[tuple[str, str]] = set()
+            for item in list(existing.get("aliases") or []) + list(incoming.get("aliases") or []):
+                if not isinstance(item, dict):
+                    continue
+                alias_value = str(item.get("value") or "").strip()
+                alias_lang = str(item.get("lang") or "").strip()
+                if not alias_value:
+                    continue
+                alias_key = (alias_value.casefold(), alias_lang)
+                if alias_key in seen:
+                    continue
+                seen.add(alias_key)
+                aliases.append({"value": alias_value, "lang": alias_lang})
+            merged["aliases"] = aliases
+            continue
+        if value not in (None, "", [], {}):
+            merged[key] = value
+    return merged
+
+
+def _selected_candidate_payload(selected: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not selected:
+        return None
+    return {
+        "source": _candidate_source(selected),
+        "authority_id": _candidate_authority_id(selected),
+        "qid": selected.get("qid", ""),
+        "label": selected.get("label", ""),
+        "description": selected.get("description", ""),
+        "score": selected.get("score", 0.0),
+        "viaf_id": selected.get("viaf_id", ""),
+        "geonames_id": selected.get("geonames_id", ""),
+        "canonical_label": selected.get("canonical_label", ""),
+        "aliases": selected.get("aliases", []),
+        "lat": selected.get("lat"),
+        "lon": selected.get("lon"),
+        "country_qids": selected.get("country_qids", []),
+        "admin_qids": selected.get("admin_qids", []),
+        "country_name": selected.get("country_name", ""),
+        "admin1_name": selected.get("admin1_name", ""),
+        "parent_location": selected.get("parent_location", ""),
+        "type_compatible": selected.get("type_compatible", False),
+    }
+
+
+def _top_candidate_payload(candidate: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "source": _candidate_source(candidate),
+        "authority_id": _candidate_authority_id(candidate),
+        "qid": candidate.get("qid", ""),
+        "label": candidate.get("label", ""),
+        "score": candidate.get("score", 0.0),
+        "type_compatible": candidate.get("type_compatible", False),
+    }
+
+
+def _persist_selected_entity(
+    *,
+    selected: dict[str, Any],
+    surface: str,
+    ent_type: str,
+) -> tuple[dict[str, Any], int]:
+    source = _candidate_source(selected)
+    authority_id = _candidate_authority_id(selected)
+    canonical_label = str(
+        selected.get("canonical_label")
+        or selected.get("label")
+        or authority_id
+        or selected.get("qid")
+        or ""
+    ).strip()
+    description = str(selected.get("canonical_description") or selected.get("description") or "").strip()
+
+    viaf_profile: dict[str, Any] = {}
+    if selected.get("viaf_id") and ent_type in {"person", "work"}:
+        try:
+            viaf_profile = _fetch_viaf_profile(str(selected.get("viaf_id") or ""))
+        except Exception as exc:  # noqa: BLE001
+            log.debug("viaf profile fetch failed for %s: %s", selected.get("viaf_id"), exc)
+            viaf_profile = {}
+
+    country_name = str(selected.get("country_name") or "").strip()
+    admin1_name = str(selected.get("admin1_name") or "").strip()
+    country_qids = list(selected.get("country_qids", []) or [])
+    admin_qids = list(selected.get("admin_qids", []) or [])
+    api_calls_get_delta = 0
+
+    if source == "wikidata":
+        if country_qids and not country_name:
+            try:
+                country_info = enrich_wikidata_item(str(country_qids[0]))
+                api_calls_get_delta += 1
+                country_name = str(country_info.get("canonical_label") or country_qids[0] or "").strip()
+            except Exception:  # noqa: BLE001
+                country_name = str(country_qids[0] or "").strip()
+        if admin_qids and not admin1_name:
+            try:
+                admin_info = enrich_wikidata_item(str(admin_qids[0]))
+                api_calls_get_delta += 1
+                admin1_name = str(admin_info.get("canonical_label") or admin_qids[0] or "").strip()
+            except Exception:  # noqa: BLE001
+                admin1_name = str(admin_qids[0] or "").strip()
+
+    parent_location = str(selected.get("parent_location") or "").strip()
+    if not parent_location:
+        parent_location = " > ".join(part for part in (admin1_name, country_name) if part)
+
+    entity_record = pipeline_db.upsert_authority_entity(
+        {
+            "entity_id": f"{source}:{authority_id}",
+            "authority_source": source,
+            "authority_id": authority_id,
+            "wikidata_qid": selected.get("qid"),
+            "viaf_id": selected.get("viaf_id"),
+            "geonames_id": selected.get("geonames_id"),
+            "canonical_label": canonical_label or authority_id or surface,
+            "normalized_label": normalise_surface(canonical_label or authority_id or surface),
+            "entity_type": ent_type,
+            "description": description or None,
+            "lat": selected.get("lat"),
+            "lon": selected.get("lon"),
+            "country_name": country_name or None,
+            "admin1_name": admin1_name or None,
+            "parent_location": parent_location or None,
+            "meta_json": {
+                "source_url": selected.get("url", ""),
+                "instance_of_qids": selected.get("instance_of_qids", []),
+                "country_qids": country_qids,
+                "admin_qids": admin_qids,
+                "titles": selected.get("titles"),
+                "name_type": selected.get("name_type"),
+                "feature_code": selected.get("feature_code"),
+                "source_confidence": selected.get("source_confidence"),
+            },
+        }
+    )
+
+    alias_rows = [
+        {"alias": canonical_label or authority_id or surface, "alias_lang": "", "alias_source": source},
+        {"alias": surface, "alias_lang": "", "alias_source": "mention_surface"},
+    ]
+    for alias in list(selected.get("aliases", []) or []):
+        if not isinstance(alias, dict):
+            continue
+        alias_rows.append(
+            {
+                "alias": str(alias.get("value") or ""),
+                "alias_lang": str(alias.get("lang") or ""),
+                "alias_source": source,
+            }
+        )
+    for alias in list(viaf_profile.get("aliases", []) or []):
+        if not isinstance(alias, dict):
+            continue
+        alias_rows.append(
+            {
+                "alias": str(alias.get("value") or ""),
+                "alias_lang": str(alias.get("lang") or ""),
+                "alias_source": "viaf",
+            }
+        )
+    pipeline_db.replace_authority_aliases(entity_record["entity_id"], alias_rows)
+
+    assertion_rows = [
+        {
+            "source_name": source,
+            "property_name": "authority_id",
+            "property_value": authority_id,
+            "source_json": {"source_url": selected.get("url", "")},
+        },
+    ]
+    if selected.get("qid"):
+        assertion_rows.append(
+            {
+                "source_name": "wikidata",
+                "property_name": "wikidata_qid",
+                "property_value": str(selected.get("qid") or ""),
+                "source_json": {"url": selected.get("url", "")},
+            }
+        )
+    if description:
+        assertion_rows.append(
+            {
+                "source_name": source,
+                "property_name": "description",
+                "property_value": description,
+                "source_json": {"description": description},
+            }
+        )
+    if entity_record.get("lat") is not None and entity_record.get("lon") is not None:
+        assertion_rows.append(
+            {
+                "source_name": source,
+                "property_name": "coordinates",
+                "property_value": f"{entity_record['lat']},{entity_record['lon']}",
+                "source_json": {"lat": entity_record["lat"], "lon": entity_record["lon"]},
+            }
+        )
+    if selected.get("viaf_id"):
+        assertion_rows.append(
+            {
+                "source_name": "viaf",
+                "property_name": "viaf_id",
+                "property_value": str(selected.get("viaf_id") or ""),
+                "source_json": viaf_profile or {"viaf_id": selected.get("viaf_id")},
+            }
+        )
+    if selected.get("geonames_id"):
+        assertion_rows.append(
+            {
+                "source_name": "geonames",
+                "property_name": "geonames_id",
+                "property_value": str(selected.get("geonames_id") or ""),
+                "source_json": {
+                    "geonames_id": selected.get("geonames_id"),
+                    "country_name": entity_record.get("country_name"),
+                    "admin1_name": entity_record.get("admin1_name"),
+                    "parent_location": entity_record.get("parent_location"),
+                },
+            }
+        )
+    if entity_record.get("country_name"):
+        assertion_rows.append(
+            {
+                "source_name": source,
+                "property_name": "country_name",
+                "property_value": str(entity_record.get("country_name") or ""),
+                "source_json": {"country_name": entity_record.get("country_name")},
+            }
+        )
+    if entity_record.get("admin1_name"):
+        assertion_rows.append(
+            {
+                "source_name": source,
+                "property_name": "admin1_name",
+                "property_value": str(entity_record.get("admin1_name") or ""),
+                "source_json": {"admin1_name": entity_record.get("admin1_name")},
+            }
+        )
+    pipeline_db.replace_authority_source_assertions(entity_record["entity_id"], assertion_rows)
+    return entity_record, api_calls_get_delta
 
 # ── API call caps ──────────────────────────────────────────────────────
 _MAX_SEARCH_CALLS_PER_RUN = 30    # max wbsearchentities calls per run
@@ -102,6 +788,83 @@ _KNOWN_PLACE_GAZETTEER: set[str] = {
     "jérusalem", "jerusalem", "constantinople", "acre",
     "norgales", "gorre", "sarras", "benoic", "gaule",
 }
+
+_WEAK_PLACE_LEXICAL_BLACKLIST: set[str] = {
+    "enfant",
+    "enfans",
+    "enfants",
+    "vilanie",
+    "vilenie",
+    "villanie",
+    "amor",
+    "amour",
+    "courtoisie",
+    "felonie",
+    "honte",
+    "honor",
+    "honneur",
+    "merci",
+    "paor",
+    "peor",
+    "peur",
+    "proece",
+    "proesce",
+    "chevalerie",
+}
+
+_PLACE_CONTEXT_PATTERNS: tuple[str, ...] = (
+    " a {surface} ",
+    " a la {surface} ",
+    " au {surface} ",
+    " aux {surface} ",
+    " as {surface} ",
+    " en {surface} ",
+    " vers {surface} ",
+    " sur {surface} ",
+    " sor {surface} ",
+    " de la cite de {surface} ",
+    " de la ville de {surface} ",
+    " del pais de {surface} ",
+    " du pais de {surface} ",
+    " en la cite de {surface} ",
+    " en la ville de {surface} ",
+)
+
+_PLACE_LOCATIVE_PREPOSITIONS: tuple[str, ...] = (
+    "a",
+    "au",
+    "aux",
+    "en",
+    "vers",
+    "sur",
+    "sor",
+    "devers",
+    "lez",
+    "pres",
+    "près",
+)
+
+_PLACE_HEADWORDS: tuple[str, ...] = (
+    "cite",
+    "cité",
+    "ville",
+    "castel",
+    "chastel",
+    "pais",
+    "pays",
+    "terre",
+    "roiaume",
+    "reaume",
+    "contree",
+    "contrée",
+    "abbaye",
+    "monastere",
+    "monastère",
+    "eglise",
+    "église",
+    "diocese",
+    "diocèse",
+)
 
 # ── Canonical Arthurian / medieval entities ────────────────────────────
 # Maps normalised canonical name → preferred query + qualifier strings.
@@ -294,6 +1057,102 @@ def _check_canonical_match(surface: str) -> dict[str, Any] | None:
                 best = {**info, "token": tok_low, "dist": raw_dist, "nd": nd, "bo": bo}
                 best_nd = nd
     return best
+
+
+def _has_strong_place_context(surface: str, evidence_text: str) -> bool:
+    import re as _re
+
+    surface_norm = normalize_for_search(surface)
+    evidence_norm = f" {normalize_for_search(evidence_text)} "
+    if not surface_norm or not evidence_norm.strip():
+        return False
+    for pattern in _PLACE_CONTEXT_PATTERNS:
+        if pattern.format(surface=surface_norm) in evidence_norm:
+            return True
+    escaped_surface = _re.escape(surface_norm)
+    locatives = "|".join(_re.escape(token) for token in _PLACE_LOCATIVE_PREPOSITIONS)
+    headwords = "|".join(_re.escape(normalize_for_search(token)) for token in _PLACE_HEADWORDS)
+    if _re.search(
+        rf"\b(?:{locatives})\b(?:\s+\w+){{0,3}}\s+{escaped_surface}\b",
+        evidence_norm,
+    ):
+        return True
+    if _re.search(
+        rf"\b(?:{headwords})\b(?:\s+\w+){{0,2}}\s+(?:de|del|du|des)\s+{escaped_surface}\b",
+        evidence_norm,
+    ):
+        return True
+    return False
+
+
+def _mention_context_window(base_text: str, start_offset: int, end_offset: int, *, radius: int = 40) -> str:
+    if not base_text:
+        return ""
+    start = max(0, int(start_offset) - radius)
+    end = min(len(base_text), int(end_offset) + radius)
+    return str(base_text[start:end] or "")
+
+
+def _display_probable_type(ent_type: str, reason: str, surface: str) -> str:
+    ent = str(ent_type or "").strip().lower() or "unknown"
+    reason_text = str(reason or "")
+    surface_low = str(surface or "").strip().lower()
+    if ent == "place":
+        if "low_evidence_place" in reason_text and ("lexical=True" in reason_text or surface_low in _WEAK_PLACE_LEXICAL_BLACKLIST):
+            return "lexical/unknown"
+        if "low_evidence_place" in reason_text and "context=False" in reason_text:
+            return "possible_place_unresolved"
+    return ent
+
+
+def _deferred_reason_for_mention(surface: str, ent_type: str, evidence_text: str, base_reason: str) -> str:
+    ent_low = str(ent_type or "").strip().lower()
+    surface_text = str(surface or "").strip()
+    surface_low = normalize_for_search(surface_text)
+    reason_text = str(base_reason or "").strip()
+    if ent_low != "place" or not surface_low:
+        return reason_text
+    is_known_place = surface_low in _KNOWN_PLACE_GAZETTEER
+    is_capitalized = surface_text[:1].isupper()
+    lexical = surface_low in _WEAK_PLACE_LEXICAL_BLACKLIST
+    context_ok = _has_strong_place_context(surface_text, evidence_text)
+    minimal_shape = len(surface_low) >= 4 and token_quality_score(surface_low) >= 0.45
+    if is_known_place or ((is_capitalized or context_ok) and not lexical and minimal_shape):
+        return reason_text
+    suffix = (
+        f"low_evidence_place: cap={is_capitalized} context={context_ok} "
+        f"lexical={lexical} shape={minimal_shape}"
+    )
+    if not reason_text:
+        return suffix
+    if suffix in reason_text:
+        return reason_text
+    return f"{reason_text}; {suffix}"
+
+
+def _summarize_authority_reason(reason: str, surface: str, ent_type: str) -> str:
+    reason_text = str(reason or "").strip()
+    surface_low = str(surface or "").strip().lower()
+    ent_low = str(ent_type or "").strip().lower()
+    if not reason_text:
+        return "no reliable authority match"
+    if "low_evidence_place" in reason_text:
+        if surface_low in _WEAK_PLACE_LEXICAL_BLACKLIST or "lexical=True" in reason_text:
+            return "insufficient evidence to treat this lexical item as a place"
+        return "insufficient contextual evidence to support place linking"
+    if "token_search_allowed=False" in reason_text:
+        return "linking deferred because the passage quality was too risky for reliable authority lookup"
+    if "name_likeness=" in reason_text:
+        return "surface form is too noisy for reliable authority lookup"
+    if reason_text == "no wikidata candidates":
+        return "no reliable authority candidate found"
+    if reason_text == "no candidate marked as selected":
+        return "no candidate met the selection threshold"
+    if reason_text == "marked ambiguous":
+        return "multiple candidates remained ambiguous"
+    if ent_low == "date" and "date" in reason_text:
+        return "date detected but not authority-linked"
+    return reason_text[:120]
 
 # ── Role-aware decomposition ───────────────────────────────────────────
 
@@ -496,9 +1355,12 @@ def run_authority_linking(
 
     # ── 2. Clear old candidates ───────────────────────────────────────
     _clear_candidates_for_run(run_id)
+    _clear_structured_links_for_run(run_id)
 
     # ── 3. Process each mention ───────────────────────────────────────
     api_calls_search = 0
+    api_calls_viaf = 0
+    api_calls_geonames = 0
     api_calls_get = 0
     cache_hits = 0
     type_mismatch_count = 0
@@ -506,6 +1368,7 @@ def run_authority_linking(
     canonical_matched = 0
     all_candidate_rows: list[dict[str, Any]] = []
     mention_results: list[dict[str, Any]] = []
+    resolved_tokens: set[str] = set()
 
     for mention in mentions:
         mention_id = str(mention["mention_id"])
@@ -515,6 +1378,27 @@ def run_authority_linking(
         start_off = int(mention.get("start_offset", 0))
         end_off = int(mention.get("end_offset", 0))
         chunk_id = mention.get("chunk_id")
+        mention_confidence = float(mention.get("confidence", 0.0))
+        evidence_text = base_text[start_off:end_off] if base_text and end_off <= len(base_text) else surface
+        evidence_span = pipeline_db.upsert_evidence_span(
+            {
+                "run_id": run_id,
+                "asset_ref": asset_ref,
+                "page_id": asset_ref or None,
+                "chunk_id": chunk_id,
+                "mention_id": mention_id,
+                "start_offset": start_off,
+                "end_offset": end_off,
+                "raw_text": evidence_text,
+                "normalized_text": normalize_for_search(evidence_text) if evidence_text else "",
+                "meta_json": {
+                    "source": "authority_linking",
+                    "ent_type": ent_type,
+                    "surface": surface,
+                },
+            }
+        )
+        evidence_span_id = str(evidence_span.get("span_id") or "")
 
         # Context: chunk text + nearby base text
         context = _build_context(
@@ -525,8 +1409,28 @@ def run_authority_linking(
         # ── Quality gate: skip non-linkable types and garbage surfaces ─
         if ent_type == "role":
             # Role mentions (trigger without plausible name) → skip
-            evidence_text = base_text[start_off:end_off] if base_text and end_off <= len(base_text) else surface
             quality_skipped += 1
+            score_breakdown = _score_breakdown_for_mention(
+                mention=mention,
+                query_details=[],
+                name_likeness=0.0,
+                canonical_match=None,
+                selected=None,
+                top_candidates=[],
+                ocr_quality=ocr_quality,
+                status="skipped",
+                reason="ent_type=role (not linkable)",
+            )
+            _persist_mention_link(
+                run_id=run_id,
+                asset_ref=asset_ref,
+                mention=mention,
+                evidence_text=evidence_text,
+                evidence_span_id=evidence_span_id,
+                status="skipped",
+                reason="ent_type=role (not linkable)",
+                score_breakdown=score_breakdown,
+            )
             mention_results.append({
                 "mention_id": mention_id,
                 "surface": surface,
@@ -552,8 +1456,28 @@ def run_authority_linking(
 
         # ── Req 3a: DATE mentions → never query Wikidata ─────────────
         if ent_type == "date":
-            evidence_text = base_text[start_off:end_off] if base_text and end_off <= len(base_text) else surface
             quality_skipped += 1
+            score_breakdown = _score_breakdown_for_mention(
+                mention=mention,
+                query_details=[],
+                name_likeness=0.0,
+                canonical_match=None,
+                selected=None,
+                top_candidates=[],
+                ocr_quality=ocr_quality,
+                status="skipped",
+                reason="ent_type=date (dates never query Wikidata)",
+            )
+            _persist_mention_link(
+                run_id=run_id,
+                asset_ref=asset_ref,
+                mention=mention,
+                evidence_text=evidence_text,
+                evidence_span_id=evidence_span_id,
+                status="skipped",
+                reason="ent_type=date (dates never query Wikidata)",
+                score_breakdown=score_breakdown,
+            )
             mention_results.append({
                 "mention_id": mention_id,
                 "surface": surface,
@@ -584,18 +1508,59 @@ def run_authority_linking(
             is_capitalized = surface.strip()[:1].isupper()
             is_known_place = surface_low in _KNOWN_PLACE_GAZETTEER
             is_blacklisted = surface_low in _EDITORIAL_BLACKLIST
+            is_weak_lexical_place = surface_low in _WEAK_PLACE_LEXICAL_BLACKLIST
+            context_window = _mention_context_window(base_text, start_off, end_off)
+            has_place_context = _has_strong_place_context(surface, context_window)
+            has_minimal_place_shape = len(surface_low) >= 4 and token_quality_score(surface_low) >= 0.45
             # Only query Wikidata if:
-            #   (a) surface is capitalized, OR
-            #   (b) matches known-place gazetteer, OR
-            #   (c) confidence >= 0.70 AND not blacklisted
+            #   (a) matches known-place gazetteer, OR
+            #   (b) surface is capitalized and does not look like a generic lexical item, OR
+            #   (c) confidence is high AND place context is strong
             place_linkable = (
-                is_capitalized
-                or is_known_place
-                or (confidence >= 0.70 and not is_blacklisted)
+                is_known_place
+                or (
+                    is_capitalized
+                    and not is_blacklisted
+                    and not is_weak_lexical_place
+                    and has_minimal_place_shape
+                )
+                or (
+                    confidence >= 0.82
+                    and has_place_context
+                    and not is_blacklisted
+                    and not is_weak_lexical_place
+                    and has_minimal_place_shape
+                )
             )
             if not place_linkable:
-                evidence_text = base_text[start_off:end_off] if base_text and end_off <= len(base_text) else surface
                 quality_skipped += 1
+                reason_text = (
+                    f"low_evidence_place: cap={is_capitalized} "
+                    f"gazetteer={is_known_place} conf={confidence:.2f} "
+                    f"blacklisted={is_blacklisted} lexical={is_weak_lexical_place} "
+                    f"context={has_place_context} shape={has_minimal_place_shape}"
+                )
+                score_breakdown = _score_breakdown_for_mention(
+                    mention=mention,
+                    query_details=[],
+                    name_likeness=0.0,
+                    canonical_match=None,
+                    selected=None,
+                    top_candidates=[],
+                    ocr_quality=ocr_quality,
+                    status="unresolved_low_quality",
+                    reason=reason_text,
+                )
+                _persist_mention_link(
+                    run_id=run_id,
+                    asset_ref=asset_ref,
+                    mention=mention,
+                    evidence_text=evidence_text,
+                    evidence_span_id=evidence_span_id,
+                    status="unresolved_low_quality",
+                    reason=reason_text,
+                    score_breakdown=score_breakdown,
+                )
                 mention_results.append({
                     "mention_id": mention_id,
                     "surface": surface,
@@ -606,12 +1571,8 @@ def run_authority_linking(
                     "evidence_text": evidence_text,
                     "queries_attempted": [],
                     "query_details": [],
-                    "status": "skipped",
-                    "reason": (
-                        f"low_evidence_place: cap={is_capitalized} "
-                        f"gazetteer={is_known_place} conf={confidence:.2f} "
-                        f"blacklisted={is_blacklisted}"
-                    ),
+                    "status": "unresolved_low_quality",
+                    "reason": reason_text,
                     "name_likeness": 0.0,
                     "canonical_match": None,
                     "selected": None,
@@ -619,17 +1580,38 @@ def run_authority_linking(
                 })
                 log.info(
                     "mention %s surface=%r SKIPPED: low_evidence_place "
-                    "(cap=%s gazetteer=%s conf=%.2f blacklisted=%s)",
+                    "(cap=%s gazetteer=%s conf=%.2f blacklisted=%s lexical=%s context=%s)",
                     mention_id, surface, is_capitalized, is_known_place,
-                    confidence, is_blacklisted,
+                    confidence, is_blacklisted, is_weak_lexical_place, has_place_context,
                 )
                 continue
 
         # Name-likeness quality score
         name_likeness = _compute_name_likeness(surface, ent_type)
         if ent_type in ("person",) and name_likeness < _NAME_QUALITY_THRESHOLD:
-            evidence_text = base_text[start_off:end_off] if base_text and end_off <= len(base_text) else surface
             quality_skipped += 1
+            reason_text = f"name_likeness={name_likeness:.3f} < {_NAME_QUALITY_THRESHOLD} (OCR garbage)"
+            score_breakdown = _score_breakdown_for_mention(
+                mention=mention,
+                query_details=[],
+                name_likeness=name_likeness,
+                canonical_match=None,
+                selected=None,
+                top_candidates=[],
+                ocr_quality=ocr_quality,
+                status="unresolved_low_quality",
+                reason=reason_text,
+            )
+            _persist_mention_link(
+                run_id=run_id,
+                asset_ref=asset_ref,
+                mention=mention,
+                evidence_text=evidence_text,
+                evidence_span_id=evidence_span_id,
+                status="unresolved_low_quality",
+                reason=reason_text,
+                score_breakdown=score_breakdown,
+            )
             mention_results.append({
                 "mention_id": mention_id,
                 "surface": surface,
@@ -640,8 +1622,8 @@ def run_authority_linking(
                 "evidence_text": evidence_text,
                 "queries_attempted": [],
                 "query_details": [],
-                "status": "skipped",
-                "reason": f"name_likeness={name_likeness:.3f} < {_NAME_QUALITY_THRESHOLD} (OCR garbage)",
+                "status": "unresolved_low_quality",
+                "reason": reason_text,
                 "name_likeness": name_likeness,
                 "canonical_match": None,
                 "selected": None,
@@ -670,12 +1652,8 @@ def run_authority_linking(
 
         # ── Query generation (progressive simplification) ─────────────
         queries = _build_query_variants(surface, method)
-        # Prepend canonical queries when matched
         if canon_match:
             canon_queries = canon_match["queries"]
-            # When canonicalization exists, use only canonical queries
-            # unless they return 0 candidates (handled in search loop).
-            # Remove the raw OCR surface query to avoid wasting API calls.
             canon_set = {cq.lower() for cq in canon_queries}
             queries = [q for q in queries if q.lower() not in canon_set]
             for cq in reversed(canon_queries):
@@ -685,151 +1663,182 @@ def run_authority_linking(
             mention_id, surface, queries, ent_type, method, name_likeness,
         )
 
-        # Collect candidates across all sub-queries
-        merged_candidates: dict[str, dict[str, Any]] = {}  # qid → wd dict
-        query_details: list[dict[str, Any]] = []  # per-query diagnostics
+        merged_candidates: dict[str, dict[str, Any]] = {}
+        query_details: list[dict[str, Any]] = []
         canon_query_count = len(canon_match["queries"]) if canon_match else 0
-        for q_idx, query_str in enumerate(queries):
-            # ── API search cap: max 30 searches per run ───────────────
-            if api_calls_search >= _MAX_SEARCH_CALLS_PER_RUN:
-                log.warning(
-                    "mention %s: search API cap reached (%d), skipping query %r",
-                    mention_id, api_calls_search, query_str,
-                )
-                break
+        effective_ent_type = "person" if method == "rule:salvage_trigger" and ent_type == "person" else ent_type
+        canonical_norm = canon_match["canon"].lower() if canon_match else ""
 
-            # ── Skip raw OCR queries when canonical search got results ─
+        for q_idx, query_str in enumerate(queries):
             if canon_match and q_idx >= canon_query_count and merged_candidates:
                 log.debug(
-                    "mention %s: canonical search produced %d candidates, "
-                    "skipping fallback query %r",
-                    mention_id, len(merged_candidates), query_str,
+                    "mention %s: canonical search produced %d candidates, skipping fallback query %r",
+                    mention_id,
+                    len(merged_candidates),
+                    query_str,
                 )
                 continue
 
-            # Determine cache status
-            _, c_status = cache_check("wikidata", query_str, max_age_hours=6.0)
-            # API is needed unless we have a real (non-empty) cache hit
-            need_api = force_refresh or c_status in ("miss", "expired", "empty-hit")
             if force_refresh:
-                c_status = "bypassed"
+                cache_status = "bypassed"
+                wikidata_mode = "api" if api_calls_search < _MAX_SEARCH_CALLS_PER_RUN else "skip"
+            else:
+                _, cache_status = cache_check("wikidata", query_str, max_age_hours=6.0)
+                if cache_status == "hit":
+                    wikidata_mode = "cache"
+                    cache_hits += 1
+                elif api_calls_search < _MAX_SEARCH_CALLS_PER_RUN:
+                    wikidata_mode = "api"
+                else:
+                    wikidata_mode = "skip"
 
-            wd_results = search_wikidata(
-                query_str, k=top_k, force_refresh=need_api,
+            if wikidata_mode == "skip" and ent_type not in {"person", "work", "place"}:
+                log.warning(
+                    "mention %s: all authority lookups skipped for query %r due to caps/type",
+                    mention_id,
+                    query_str,
+                )
+                break
+
+            source_results, search_calls, viaf_calls, geonames_calls = _search_all_sources_for_query(
+                query_str,
+                ent_type=effective_ent_type,
+                top_k=top_k,
+                wikidata_mode=wikidata_mode,
+            )
+            api_calls_search += search_calls
+            api_calls_viaf += viaf_calls
+            api_calls_geonames += geonames_calls
+
+            raw_hits_by_source: dict[str, list[dict[str, Any]]] = {}
+            for source_name, candidates in source_results.items():
+                raw_hits_by_source[source_name] = [
+                    {
+                        "source": source_name,
+                        "authority_id": _candidate_authority_id(candidate),
+                        "qid": candidate.get("qid", ""),
+                        "label": candidate.get("label", ""),
+                        "description": candidate.get("description", ""),
+                        "search_rank": idx + 1,
+                    }
+                    for idx, candidate in enumerate(candidates[:5])
+                ]
+                for candidate in candidates:
+                    candidate_payload = dict(candidate)
+                    candidate_payload["source"] = source_name
+                    candidate_payload["authority_id"] = _candidate_authority_id(candidate_payload)
+                    identity_key = _candidate_identity_key(candidate_payload)
+                    if identity_key in merged_candidates:
+                        merged_candidates[identity_key] = _merge_candidate(merged_candidates[identity_key], candidate_payload)
+                    else:
+                        merged_candidates[identity_key] = candidate_payload
+
+            query_details.append(
+                {
+                    "query": query_str,
+                    "cache_status": cache_status,
+                    "wikidata_called": wikidata_mode == "api",
+                    "raw_hits": raw_hits_by_source.get("wikidata", []),
+                    "raw_hits_by_source": raw_hits_by_source,
+                    "source_hit_counts": {source_name: len(candidates) for source_name, candidates in source_results.items()},
+                }
             )
 
-            if need_api:
-                api_calls_search += 1
-            else:
-                cache_hits += 1
-
-            raw_hits = [
-                {
-                    "qid": w.get("qid", ""),
-                    "label": w.get("label", ""),
-                    "description": w.get("description", ""),
-                    "search_rank": i + 1,
-                }
-                for i, w in enumerate(wd_results[:5])
+        candidates = list(merged_candidates.values())
+        if ent_type in {"person", "work"} and candidates:
+            wikidata_candidates = [
+                candidate for candidate in candidates if _candidate_source(candidate) == "wikidata"
+            ]
+            filtered_wikidata = _prefilter_candidates(wikidata_candidates, surface, ent_type)
+            allowed_keys = {_candidate_identity_key(candidate) for candidate in filtered_wikidata}
+            candidates = [
+                candidate
+                for candidate in candidates
+                if _candidate_source(candidate) != "wikidata" or _candidate_identity_key(candidate) in allowed_keys
             ]
 
-            query_details.append({
-                "query": query_str,
-                "cache_status": c_status,
-                "wikidata_called": need_api,
-                "raw_hits": raw_hits,
-            })
-
-            for wd in wd_results:
-                qid = wd.get("qid", "")
-                if qid and qid not in merged_candidates:
-                    merged_candidates[qid] = wd
-
-        wd_candidates = list(merged_candidates.values())
-
-        # ── Pre-filter: reject obviously irrelevant candidates ────────
-        # For medieval person/work mentions, reject candidates whose
-        # description contains modern-occupation keywords.
-        if ent_type in ("person", "work") and wd_candidates:
-            wd_candidates = _prefilter_candidates(
-                wd_candidates, surface, ent_type,
-            )
-
-        # For PERSON_OR_ROLE mentions from salvage_trigger, force type
-        # gate to require human (Q5) / fictional human (Q15632617).
-        effective_ent_type = ent_type
-        if method == "rule:salvage_trigger" and ent_type == "person":
-            effective_ent_type = "person"  # already correct; explicit
-
-        # Derive canonical norm for scoring (e.g. "lancelot")
-        canonical_norm = ""
-        if canon_match:
-            canonical_norm = canon_match["canon"].lower()
-
-        # Score each candidate — enrich for P31
-        # ── Enrichment cap: max 3 wbgetentities per mention ───────────
         scored: list[dict[str, Any]] = []
         enrich_count = 0
-        for wd in wd_candidates:
-            qid = wd.get("qid", "")
-            label = wd.get("label", "")
-            description = wd.get("description", "")
+        for candidate in candidates:
+            source_name = _candidate_source(candidate)
+            authority_id = _candidate_authority_id(candidate)
+            description = str(candidate.get("description") or "")
+            enriched_candidate = dict(candidate)
 
-            # Fetch P31 for type checking (+ VIAF/GeoNames), capped
-            if qid and enrich_count < _MAX_ENRICH_PER_MENTION:
-                enrichment = enrich_wikidata_item(qid)
+            if source_name == "wikidata" and candidate.get("qid") and enrich_count < _MAX_ENRICH_PER_MENTION:
+                enrichment = enrich_wikidata_item(str(candidate.get("qid") or ""))
                 api_calls_get += 1
                 enrich_count += 1
+                enriched_candidate = _merge_candidate(enriched_candidate, enrichment)
             else:
                 enrichment = {}
-            instance_of = enrichment.get("instance_of_qids", [])
+
+            instance_of = list(enriched_candidate.get("instance_of_qids", []) or [])
             type_ok = is_type_compatible(
-                effective_ent_type, instance_of,
-                description=description,
+                effective_ent_type,
+                instance_of,
+                description=str(enriched_candidate.get("canonical_description") or description or ""),
             )
             if not type_ok:
                 type_mismatch_count += 1
 
-            # Domain bonus from description keywords
-            desc_low = description.lower()
-            domain_bonus = 0.0
-            for kw in _MEDIEVAL_DOMAIN_KEYWORDS:
-                if kw in desc_low:
-                    domain_bonus += 0.05
-            domain_bonus = min(0.20, domain_bonus)
+            desc_low = " ".join(
+                part
+                for part in [
+                    str(enriched_candidate.get("description") or ""),
+                    str(enriched_candidate.get("canonical_description") or ""),
+                    str(enriched_candidate.get("parent_location") or ""),
+                ]
+                if part
+            ).lower()
+            domain_bonus = min(0.20, sum(0.05 for kw in _MEDIEVAL_DOMAIN_KEYWORDS if kw in desc_low))
+            if source_name == "wikidata" and enriched_candidate.get("qid"):
+                domain_bonus = min(0.22, domain_bonus + 0.02)
 
-            score = compute_score(
-                surface, label, context, description,
-                type_compatible=type_ok,
+            score, score_parts = _score_candidate(
+                mention=mention,
+                candidate=enriched_candidate,
+                context=context,
                 canonical_norm=canonical_norm,
                 domain_bonus=domain_bonus,
+                type_ok=type_ok,
+                resolved_tokens=resolved_tokens,
             )
-            scored.append({
-                "qid": qid,
-                "label": label,
-                "description": description,
-                "url": wd.get("url", ""),
-                "score": round(score, 4),
-                "type_compatible": type_ok,
-                "viaf_id": enrichment.get("viaf_id", ""),
-                "geonames_id": enrichment.get("geonames_id", ""),
-                "instance_of_qids": instance_of,
-            })
+            scored.append(
+                {
+                    **enriched_candidate,
+                    "source": source_name,
+                    "authority_id": authority_id,
+                    "score": score,
+                    "type_compatible": type_ok,
+                    "score_breakdown": score_parts,
+                    "instance_of_qids": instance_of,
+                    "canonical_label": enriched_candidate.get("canonical_label", ""),
+                    "canonical_description": enriched_candidate.get("canonical_description", ""),
+                    "aliases": enriched_candidate.get("aliases", []),
+                    "lat": enriched_candidate.get("lat"),
+                    "lon": enriched_candidate.get("lon"),
+                    "country_qids": enriched_candidate.get("country_qids", []),
+                    "admin_qids": enriched_candidate.get("admin_qids", []),
+                    "country_name": enriched_candidate.get("country_name", ""),
+                    "admin1_name": enriched_candidate.get("admin1_name", ""),
+                    "parent_location": enriched_candidate.get("parent_location", ""),
+                }
+            )
 
-        # ── Canonical rescoring: boost high-confidence canonical matches ─
         if canonical_norm and scored:
             scored = rescore_with_canonical(scored, canonical_norm)
 
-        # Disambiguate (precision-first v2, quality-adaptive v4)
         result = disambiguate(scored, ocr_quality=ocr_quality)
         selected = result["selected"]
         status = result["status"]
         reason = result["reason"]
 
-        # Build candidate rows for DB insertion
         for i, cand in enumerate(result["all"]):
             is_selected = selected is not None and cand is selected
             meta = {
+                "source": _candidate_source(cand),
+                "authority_id": _candidate_authority_id(cand),
                 "qid": cand.get("qid", ""),
                 "label": cand.get("label", ""),
                 "description": cand.get("description", ""),
@@ -838,20 +1847,71 @@ def run_authority_linking(
                 "geonames_id": cand.get("geonames_id", ""),
                 "type_compatible": cand.get("type_compatible", False),
                 "instance_of_qids": cand.get("instance_of_qids", []),
+                "score_breakdown": cand.get("score_breakdown", {}),
                 "is_selected": is_selected,
                 "link_status": status if is_selected else "",
                 "rank": i + 1,
             }
-            all_candidate_rows.append({
-                "mention_id": mention_id,
-                "source": "wikidata",
-                "candidate": cand.get("qid", ""),
-                "score": cand.get("score", 0.0),
-                "meta_json": meta,
-            })
+            all_candidate_rows.append(
+                {
+                    "mention_id": mention_id,
+                    "source": _candidate_source(cand),
+                    "candidate": _candidate_authority_id(cand),
+                    "score": cand.get("score", 0.0),
+                    "meta_json": meta,
+                }
+            )
 
-        # Evidence span text
-        evidence_text = base_text[start_off:end_off] if base_text and end_off <= len(base_text) else surface
+        top_candidates = [_top_candidate_payload(candidate) for candidate in result["all"][:3]]
+        selected_payload = _selected_candidate_payload(selected)
+        score_breakdown = _score_breakdown_for_mention(
+            mention=mention,
+            query_details=query_details,
+            name_likeness=name_likeness,
+            canonical_match=canon_match_info,
+            selected=selected_payload,
+            top_candidates=top_candidates,
+            ocr_quality=ocr_quality,
+            status=status,
+            reason=reason,
+        )
+
+        if selected and _candidate_authority_id(selected):
+            entity_record, entity_api_calls = _persist_selected_entity(
+                selected=selected,
+                surface=surface,
+                ent_type=ent_type,
+            )
+            api_calls_get += entity_api_calls
+            selected_payload = {
+                **(selected_payload or {}),
+                "entity_id": entity_record.get("entity_id"),
+            }
+            for token in normalize_for_search(
+                " ".join(
+                    part
+                    for part in [
+                        str(entity_record.get("canonical_label") or ""),
+                        str(entity_record.get("country_name") or ""),
+                        str(entity_record.get("admin1_name") or ""),
+                    ]
+                    if part
+                )
+            ).split():
+                if len(token) >= 3:
+                    resolved_tokens.add(token)
+
+        _persist_mention_link(
+            run_id=run_id,
+            asset_ref=asset_ref,
+            mention=mention,
+            evidence_text=evidence_text,
+            evidence_span_id=evidence_span_id,
+            status=status,
+            reason=reason,
+            score_breakdown=score_breakdown,
+            selected=selected,
+        )
 
         mention_results.append({
             "mention_id": mention_id,
@@ -867,23 +1927,8 @@ def run_authority_linking(
             "reason": reason,
             "name_likeness": name_likeness,
             "canonical_match": canon_match_info,
-            "selected": {
-                "qid": selected.get("qid", ""),
-                "label": selected.get("label", ""),
-                "description": selected.get("description", ""),
-                "score": selected.get("score", 0.0),
-                "viaf_id": selected.get("viaf_id", ""),
-                "geonames_id": selected.get("geonames_id", ""),
-            } if selected else None,
-            "top_candidates": [
-                {
-                    "qid": c.get("qid", ""),
-                    "label": c.get("label", ""),
-                    "score": c.get("score", 0.0),
-                    "type_compatible": c.get("type_compatible", False),
-                }
-                for c in result["all"][:3]
-            ],
+            "selected": selected_payload,
+            "top_candidates": top_candidates,
         })
 
     # ── 4. Persist candidates ─────────────────────────────────────────
@@ -894,11 +1939,28 @@ def run_authority_linking(
 
     # Counts
     type_counts = Counter(str(m.get("ent_type", "unknown")) for m in mentions)
-    source_counts = Counter("wikidata" for _ in all_candidate_rows)
+    source_counts = Counter(str(row.get("source") or "unknown") for row in all_candidate_rows)
     linked_total = sum(1 for r in mention_results if r["status"] == "linked")
-    unresolved_total = sum(1 for r in mention_results if r["status"] == "unresolved")
+    unresolved_total = sum(1 for r in mention_results if _is_unresolved_status(r["status"]))
     ambiguous_total = sum(1 for r in mention_results if r["status"] == "ambiguous")
     skipped_total = sum(1 for r in mention_results if r["status"] == "skipped")
+
+    log.info(
+        "authority linking summary run_id=%s mentions=%d candidates=%d linked=%d unresolved=%d ambiguous=%d skipped=%d sources=%s api_calls_search=%d api_calls_viaf=%d api_calls_geonames=%d api_calls_get=%d took_ms=%d",
+        run_id,
+        len(mentions),
+        len(all_candidate_rows),
+        linked_total,
+        unresolved_total,
+        ambiguous_total,
+        skipped_total,
+        dict(source_counts),
+        api_calls_search,
+        api_calls_viaf,
+        api_calls_geonames,
+        api_calls_get,
+        elapsed_ms,
+    )
 
     return {
         "run_id": run_id,
@@ -915,8 +1977,10 @@ def run_authority_linking(
         "canonical_matched": canonical_matched,
         "type_mismatch_count": type_mismatch_count,
         "api_calls_search": api_calls_search,
+        "api_calls_viaf": api_calls_viaf,
+        "api_calls_geonames": api_calls_geonames,
         "api_calls_get": api_calls_get,
-        "api_calls": api_calls_search + api_calls_get,
+        "api_calls": api_calls_search + api_calls_viaf + api_calls_geonames + api_calls_get,
         "cache_hits": cache_hits,
         "took_ms": elapsed_ms,
         "ocr_quality": ocr_quality,
@@ -947,16 +2011,15 @@ def _build_context(
 
 
 def _clear_candidates_for_run(run_id: str) -> None:
-    """Remove existing Wikidata candidates for this run (keep heuristic ones)."""
+    """Remove existing authority candidates for this run."""
     pipeline_db._init_db_if_needed()
     with pipeline_db._connect() as conn:
         conn.execute(
             """
             DELETE FROM entity_candidates
-            WHERE source='wikidata'
-              AND mention_id IN (
-                  SELECT mention_id FROM entity_mentions WHERE run_id=?
-              )
+            WHERE mention_id IN (
+                SELECT mention_id FROM entity_mentions WHERE run_id=?
+            )
             """,
             (run_id,),
         )
@@ -976,12 +2039,149 @@ def _empty_result(run_id: str, reason: str) -> dict[str, Any]:
         "ambiguous_total": 0,
         "type_mismatch_count": 0,
         "api_calls_search": 0,
+        "api_calls_viaf": 0,
+        "api_calls_geonames": 0,
         "api_calls_get": 0,
         "api_calls": 0,
         "cache_hits": 0,
         "took_ms": 0,
         "mention_results": [],
         "_base_text": "",
+    }
+
+
+def _build_result_from_structured_rows(
+    *,
+    run_id: str,
+    asset_ref: str,
+    base_text: str,
+    mentions: list[dict[str, Any]],
+    structured_rows: list[dict[str, Any]],
+    candidate_rows: list[dict[str, Any]],
+) -> dict[str, Any]:
+    rows_by_mention = {str(row.get("mention_id") or ""): row for row in structured_rows}
+    candidate_rows_by_mention: dict[str, list[dict[str, Any]]] = {}
+    for candidate in candidate_rows:
+        candidate_rows_by_mention.setdefault(str(candidate.get("mention_id") or ""), []).append(candidate)
+
+    type_counts: Counter[str] = Counter()
+    mention_results: list[dict[str, Any]] = []
+    linked_total = 0
+    unresolved_total = 0
+    ambiguous_total = 0
+    skipped_total = 0
+    source_counts: Counter[str] = Counter()
+
+    for row in structured_rows:
+        authority_source = str(row.get("authority_source") or "").strip()
+        if authority_source:
+            source_counts[authority_source] += 1
+    for candidate in candidate_rows:
+        source_counts[str(candidate.get("source") or "unknown")] += 1
+
+    for mention in mentions:
+        mid = str(mention.get("mention_id") or "")
+        etype = str(mention.get("ent_type") or "unknown")
+        type_counts[etype] += 1
+        surface = str(mention.get("surface") or "")
+        start_off = int(mention.get("start_offset", 0))
+        end_off = int(mention.get("end_offset", 0))
+        chunk_id = mention.get("chunk_id")
+        evidence_text = base_text[start_off:end_off] if base_text and end_off <= len(base_text) else surface
+        link_row = rows_by_mention.get(mid)
+        status = str(link_row.get("link_status") or "unresolved") if link_row else "unresolved"
+        reason = str(link_row.get("reason") or "no structured link row") if link_row else "no structured link row"
+
+        if status == "linked":
+            linked_total += 1
+        elif status == "ambiguous":
+            ambiguous_total += 1
+        elif status == "skipped":
+            skipped_total += 1
+        else:
+            unresolved_total += 1
+
+        selected = None
+        if link_row and str(link_row.get("entity_id") or "").strip():
+            selected = {
+                "source": str(link_row.get("authority_source") or ""),
+                "authority_id": str(link_row.get("authority_id") or ""),
+                "qid": str(link_row.get("wikidata_qid") or ""),
+                "label": str(link_row.get("canonical_label") or ""),
+                "description": str(link_row.get("description") or ""),
+                "score": float(link_row.get("confidence") or 0.0),
+                "viaf_id": str(link_row.get("viaf_id") or ""),
+                "geonames_id": str(link_row.get("geonames_id") or ""),
+                "type_compatible": link_row.get("type_compatible"),
+            }
+
+        top_candidates = []
+        for candidate in candidate_rows_by_mention.get(mid, [])[:3]:
+            meta = candidate.get("meta_json") or {}
+            if isinstance(meta, str):
+                try:
+                    meta = json.loads(meta)
+                except Exception:
+                    meta = {}
+            top_candidates.append(
+                {
+                    "source": meta.get("source", candidate.get("source", "")),
+                    "authority_id": meta.get("authority_id", candidate.get("candidate", "")),
+                    "qid": meta.get("qid", candidate.get("candidate", "")),
+                    "label": meta.get("label", ""),
+                    "score": float(candidate.get("score", 0.0)),
+                    "type_compatible": meta.get("type_compatible", True),
+                }
+            )
+
+        mention_results.append(
+            {
+                "mention_id": mid,
+                "surface": surface,
+                "ent_type": etype,
+                "chunk_id": chunk_id,
+                "start_offset": start_off,
+                "end_offset": end_off,
+                "evidence_text": str(link_row.get("evidence_raw_text") or evidence_text) if link_row else evidence_text,
+                "status": status,
+                "reason": reason,
+                "selected": selected,
+                "top_candidates": top_candidates,
+                "query_details": [],
+                "queries_attempted": [surface] if surface else [],
+                "canonical_match": None,
+                "name_likeness": None,
+            }
+        )
+
+    return {
+        "run_id": run_id,
+        "asset_ref": asset_ref,
+        "mentions_total": len(mentions),
+        "type_counts": dict(type_counts),
+        "candidates_total": len(candidate_rows),
+        "source_counts": dict(source_counts),
+        "linked_total": linked_total,
+        "unresolved_total": unresolved_total,
+        "ambiguous_total": ambiguous_total,
+        "skipped_total": skipped_total,
+        "quality_skipped": skipped_total,
+        "canonical_matched": 0,
+        "type_mismatch_count": sum(
+            1
+            for candidate in candidate_rows
+            if isinstance(candidate.get("meta_json"), dict) and candidate["meta_json"].get("type_compatible") is False
+        ),
+        "api_calls_search": 0,
+        "api_calls_viaf": 0,
+        "api_calls_geonames": 0,
+        "api_calls_get": 0,
+        "api_calls": 0,
+        "cache_hits": 0,
+        "took_ms": 0,
+        "ocr_quality": text_quality_label(base_text) if base_text else "LOW",
+        "mention_results": mention_results,
+        "_base_text": base_text,
     }
 
 
@@ -1028,6 +2228,29 @@ def build_report_from_db(run_id: str) -> dict[str, Any]:
             except Exception:
                 pass
         cands_by_mention.setdefault(mid, []).append(cand)
+
+    structured_rows = pipeline_db.list_mention_links_for_run(run_id)
+    if structured_rows:
+        candidate_rows = []
+        for row in rows:
+            candidate_row = {k: row[k] for k in row.keys()}
+            meta = candidate_row.get("meta_json")
+            if isinstance(meta, str):
+                try:
+                    candidate_row["meta_json"] = json.loads(meta)
+                except Exception:
+                    pass
+            candidate_rows.append(candidate_row)
+        result = _build_result_from_structured_rows(
+            run_id=run_id,
+            asset_ref=asset_ref,
+            base_text=base_text,
+            mentions=mentions,
+            structured_rows=structured_rows,
+            candidate_rows=candidate_rows,
+        )
+        result["report"] = build_linking_report(result)
+        return result
 
     type_counts: Counter[str] = Counter()
     mention_results: list[dict[str, Any]] = []
@@ -1124,6 +2347,10 @@ def build_report_from_db(run_id: str) -> dict[str, Any]:
         "unresolved_total": unresolved_total,
         "ambiguous_total": ambiguous_total,
         "api_calls": 0,
+        "api_calls_search": 0,
+        "api_calls_viaf": 0,
+        "api_calls_geonames": 0,
+        "api_calls_get": 0,
         "cache_hits": 0,
         "took_ms": 0,
         "mention_results": mention_results,
@@ -1137,726 +2364,85 @@ def build_report_from_db(run_id: str) -> dict[str, Any]:
 
 
 def build_linking_report_from_db(run_id: str) -> str:
-    """Build a fully DB-backed ENTITY LINKING REPORT (Option 1: minimal & safe).
-
-    Every line is derived from SQL queries over persisted tables only:
-      - entity_mentions   → mention counts, types
-      - entity_candidates → candidate counts, linked/unresolved/ambiguous,
-                            top linked entities, type mismatches
-      - entity_decisions  → extraction decisions (for AUDIT cross-ref)
-
-    Sections that were trace-only (queries_attempted, raw_hits,
-    cache_status, api_calls, wikidata_called) are deliberately OMITTED
-    because they are NOT persisted.  This ensures AUDIT_4 compliance.
-    """
-    L: list[str] = []
-
-    # ── Load run metadata ──────────────────────────────────────────
-    run = pipeline_db.get_run(run_id)
-    asset_ref = str(run.get("asset_ref") or "?") if run else "?"
-    base_text = str(run.get("proofread_text") or run.get("ocr_text") or "") if run else ""
-
-    # ── Load mentions from DB ──────────────────────────────────────
-    mentions = pipeline_db.list_entity_mentions(run_id)
-
-    # ── Load candidates from DB ────────────────────────────────────
-    pipeline_db._init_db_if_needed()
-    with pipeline_db._connect() as conn:
-        cand_rows = conn.execute(
-            """
-            SELECT c.* FROM entity_candidates c
-            JOIN entity_mentions m ON m.mention_id = c.mention_id
-            WHERE m.run_id=?
-            ORDER BY c.score DESC
-            """,
-            (run_id,),
-        ).fetchall()
-    all_cands: list[dict[str, Any]] = []
-    cands_by_mention: dict[str, list[dict[str, Any]]] = {}
-    for row in cand_rows:
-        cand: dict[str, Any] = {k: row[k] for k in row.keys()}
-        if cand.get("meta_json") and isinstance(cand["meta_json"], str):
-            try:
-                cand["meta_json"] = json.loads(cand["meta_json"])
-            except Exception:
-                pass
-        all_cands.append(cand)
-        cands_by_mention.setdefault(str(cand["mention_id"]), []).append(cand)
-
-    # ── Classify mentions ──────────────────────────────────────────
-    type_counts: Counter[str] = Counter()
-    linked_entries: list[dict[str, Any]] = []
-    unresolved_entries: list[dict[str, Any]] = []
-    ambiguous_entries: list[dict[str, Any]] = []
-    skipped_entries: list[dict[str, Any]] = []
-    type_mismatches: list[dict[str, Any]] = []
-
-    _QUALITY_SKIP_TYPES = {"role", "date", "editorial"}
-    _LINKABLE_TYPES = {"person", "place", "work"}
-
-    for m in mentions:
-        mid = str(m["mention_id"])
-        etype = str(m.get("ent_type") or "unknown")
-        type_counts[etype] += 1
-        surface = str(m.get("surface") or "")
-        start_off = int(m.get("start_offset", 0))
-        end_off = int(m.get("end_offset", 0))
-        chunk_id = m.get("chunk_id")
-        evidence_text = base_text[start_off:end_off] if base_text and end_off <= len(base_text) else surface
-
-        cands = cands_by_mention.get(mid, [])
-
-        # Determine linking status from candidates
-        selected_cand = None
-        status = "unresolved"
-        reason = "no candidates"
-        for c in cands:
-            meta = c.get("meta_json") or {}
-            if isinstance(meta, dict) and meta.get("is_selected"):
-                selected_cand = c
-                status = str(meta.get("link_status", "linked"))
-                reason = f"score={c.get('score', 0):.4f}"
-                break
-
-        if selected_cand is None and cands:
-            any_meta = (cands[0].get("meta_json") or {})
-            if isinstance(any_meta, dict) and any_meta.get("link_status") == "ambiguous":
-                status = "ambiguous"
-                reason = "ambiguous (no clear winner)"
-            else:
-                status = "unresolved"
-                reason = "no selected candidate"
-
-        # Quality-skipped mentions (role/date treated as skip)
-        if etype in _QUALITY_SKIP_TYPES and not cands:
-            status = "skipped"
-            reason = f"quality_skip: ent_type={etype}"
-
-        sel_meta = (selected_cand.get("meta_json") or {}) if selected_cand else {}
-        if isinstance(sel_meta, str):
-            try:
-                sel_meta = json.loads(sel_meta)
-            except Exception:
-                sel_meta = {}
-
-        entry = {
-            "mention_id": mid,
-            "surface": surface,
-            "ent_type": etype,
-            "chunk_id": chunk_id,
-            "start_offset": start_off,
-            "end_offset": end_off,
-            "evidence_text": evidence_text,
-            "status": status,
-            "reason": reason,
-            "selected": {
-                "qid": sel_meta.get("qid", ""),
-                "label": sel_meta.get("label", ""),
-                "description": sel_meta.get("description", ""),
-                "score": float(selected_cand.get("score", 0)) if selected_cand else 0.0,
-                "viaf_id": sel_meta.get("viaf_id", ""),
-                "geonames_id": sel_meta.get("geonames_id", ""),
-                "type_compatible": sel_meta.get("type_compatible", True),
-            } if selected_cand else None,
-        }
-
-        if status == "linked":
-            linked_entries.append(entry)
-        elif status == "ambiguous":
-            ambiguous_entries.append(entry)
-        elif status == "skipped":
-            skipped_entries.append(entry)
-        else:
-            unresolved_entries.append(entry)
-
-        # Type-mismatch detection from ALL candidates
-        for c in cands:
-            cmeta = c.get("meta_json") or {}
-            if isinstance(cmeta, dict) and cmeta.get("type_compatible") is False:
-                type_mismatches.append({
-                    "surface": surface,
-                    "ent_type": etype,
-                    "qid": cmeta.get("qid", c.get("candidate", "?")),
-                    "label": cmeta.get("label", "?"),
-                    "score": float(c.get("score", 0)),
-                })
-
-    candidates_total = len(all_cands)
-    source_counts: Counter[str] = Counter()
-    for c in all_cands:
-        source_counts[str(c.get("source", "unknown"))] += 1
-
-    # ── Section 1: Summary (DB-derived only) ───────────────────────
-    L.append("=== ENTITY LINKING REPORT ===")
-    L.append(f"run_id: {run_id}")
-    L.append(f"asset_ref: {asset_ref}")
-    L.append(f"mentions_total: {len(mentions)}")
-
-    if type_counts:
-        parts = [f"{k}={v}" for k, v in sorted(type_counts.items())]
-        L.append(f"  by_type: {', '.join(parts)}")
-
-    L.append(f"candidates_total: {candidates_total}")
-    if source_counts:
-        parts = [f"{k}={v}" for k, v in sorted(source_counts.items())]
-        L.append(f"  by_source: {', '.join(parts)}")
-
-    L.append(f"linked_total: {len(linked_entries)}")
-    L.append(f"unresolved_total: {len(unresolved_entries)}")
-    L.append(f"ambiguous_total: {len(ambiguous_entries)}")
-    L.append(f"skipped_total: {len(skipped_entries)}")
-    L.append(f"type_mismatch_count: {len(type_mismatches)}")
-    L.append("")
-
-    # ── Section 2: Top Linked Entities (DB-only) ───────────────────
-    top_linked = sorted(
-        linked_entries,
-        key=lambda e: (e.get("selected") or {}).get("score", 0),
-        reverse=True,
-    )[:10]
-
-    L.append(f"=== TOP LINKED ENTITIES (N={len(top_linked)}) ===")
-    for entry in top_linked:
-        sel = entry.get("selected") or {}
-        L.append(f"  mention_id: {entry['mention_id']}")
-        L.append(f"  surface: \"{entry['surface']}\"")
-        L.append(f"  ent_type: {entry['ent_type']}")
-        L.append(f"  offsets: {entry['start_offset']}-{entry['end_offset']}")
-        L.append(f"  evidence: \"{entry['evidence_text']}\"")
-        L.append(f"  \u2192 Wikidata: {sel.get('qid', '?')} | {sel.get('label', '?')} | {sel.get('description', '')}")
-        viaf = sel.get("viaf_id", "")
-        geo = sel.get("geonames_id", "")
-        if viaf or geo:
-            viaf_display = viaf or "-"
-            geo_display = geo or "-"
-            L.append(f"    VIAF: {viaf_display}  GeoNames: {geo_display}")
-        L.append(f"    score: {sel.get('score', 0):.4f}")
-        L.append("")
-    if not top_linked:
-        L.append("  (none)")
-        L.append("")
-
-    # ── Section 3: Type-Mismatch Detections (DB-only) ──────────────
-    tm_preview = type_mismatches[:10]
-    L.append(f"=== TYPE-MISMATCH DETECTIONS (N={len(type_mismatches)}) ===")
-    for tm in tm_preview:
-        L.append(
-            f"  surface=\"{tm['surface']}\" ent_type={tm['ent_type']} "
-            f"\u2192 {tm['qid']} | {tm['label']} | score={tm['score']:.4f} [REJECTED]"
-        )
-    if not tm_preview:
-        L.append("  (none)")
-    L.append("")
-
-    # ── Section 4: Failures/Edge Cases (DB-only) ───────────────────
-    failures = unresolved_entries + ambiguous_entries
-    top_failures = failures[:10]
-    L.append(f"=== FAILURE/EDGE CASES (N={len(top_failures)}) ===")
-    for entry in top_failures:
-        L.append(f"  mention_id: {entry['mention_id']}")
-        L.append(f"  surface: \"{entry['surface']}\"")
-        L.append(f"  ent_type: {entry['ent_type']}")
-        L.append(f"  status: {entry['status']}")
-        L.append(f"  reason: {entry['reason']}")
-        L.append("")
-    if not top_failures:
-        L.append("  (none)")
-        L.append("")
-
-    # ── Section 5: Validation Summary (DB-only gates) ──────────────
-    mentions_total = len(mentions)
-    linked_total_val = len(linked_entries)
-    skipped_total_val = len(skipped_entries)
-
-    # Check NO_ENTITIES_PRESENT
-    no_entities_pass = False
-    if mentions_total == 0:
-        if base_text:
-            from app.routers.ocr import _has_entity_cues
-            has_cues = _has_entity_cues(base_text)
-        else:
-            has_cues = False
-        if not has_cues:
-            no_entities_pass = True
-
-    all_skipped = mentions_total > 0 and skipped_total_val == mentions_total
-
-    # Determine if any strong linkable mentions exist (persons/places with candidates)
-    has_strong_linkable = any(
-        e["ent_type"] in _LINKABLE_TYPES and cands_by_mention.get(e["mention_id"])
-        for e in linked_entries + unresolved_entries + ambiguous_entries
-    )
-
-    no_linkable = (
-        mentions_total > 0
-        and linked_total_val == 0
-        and not all_skipped
-        and not has_strong_linkable
-    )
-
-    if no_entities_pass or all_skipped or no_linkable:
-        gate_a = True
-        gate_b = True
-        gate_c = True
-    else:
-        gate_a = mentions_total > 0
-        gate_b = candidates_total > 0
-        gate_c = linked_total_val > 0
-
-    # Gate D: no type-mismatch auto-links
-    gate_d = all(
-        (e.get("selected") or {}).get("type_compatible", True) is not False
-        for e in linked_entries
-    ) if linked_entries else True
-
-    # Gate E: referential integrity — all mention_ids link to entity_mentions
-    all_mention_ids = {str(m["mention_id"]) for m in mentions}
-    classified_ids = {e["mention_id"] for e in linked_entries + unresolved_entries + ambiguous_entries + skipped_entries}
-    gate_e = classified_ids <= all_mention_ids if mentions_total > 0 else True
-
-    # Gate F: every linked entity has evidence text
-    gate_f = all(bool(e.get("evidence_text", "").strip()) for e in linked_entries)
-
-    # Gate G: at least one candidate exists when linkable mentions > 0
-    linkable_mentions = mentions_total - skipped_total_val
-    gate_g = True
-    if linkable_mentions > 0 and not no_linkable:
-        gate_g = candidates_total > 0
-
-    # Gate H: no type-incompatible auto-links (same as D for DB path)
-    gate_h = gate_d
-
-    # ── AUDIT gates (DB-only) ──────────────────────────────────────
-    # AUDIT_1–3 are computed in the mention extraction report; we add AUDIT_4 here.
-
-    # AUDIT_4: every entity/link printed above is derivable from DB tables
-    # By construction (Option 1), we only printed data from entity_mentions +
-    # entity_candidates. Verify: all printed mention_ids exist in entity_mentions,
-    # all selected QIDs come from entity_candidates.meta_json.
-    audit_4_pass = True
-    for entry in linked_entries:
-        if entry["mention_id"] not in all_mention_ids:
-            audit_4_pass = False
-            break
-        # Verify selected candidate exists in DB
-        sel = entry.get("selected") or {}
-        if sel.get("qid"):
-            mention_cands = cands_by_mention.get(entry["mention_id"], [])
-            qid_found = any(
-                ((c.get("meta_json") or {}).get("qid") == sel["qid"])
-                for c in mention_cands
-            )
-            if not qid_found:
-                audit_4_pass = False
-                break
-
-    mentions_linkable = mentions_total - skipped_total_val
-
-    L.append("=== VALIDATION SUMMARY ===")
-    L.append(f"mentions_total: {mentions_total}")
-    L.append(f"mentions_linkable_total: {mentions_linkable}")
-    L.append(f"mentions_skipped_total: {skipped_total_val}")
-
-    if no_entities_pass:
-        L.append("Gate A (mentions_total > 0): PASS (NO_ENTITIES_PRESENT)")
-        L.append("Gate B (candidates_total > 0): PASS (NO_ENTITIES_PRESENT)")
-        L.append("Gate C (linked_total > 0): PASS (NO_ENTITIES_PRESENT)")
-    elif all_skipped:
-        L.append("Gate A (mentions_total > 0): PASS (ALL_QUALITY_SKIPPED)")
-        L.append("Gate B (candidates_total > 0): PASS (ALL_QUALITY_SKIPPED)")
-        L.append("Gate C (linked_total > 0): PASS (ALL_QUALITY_SKIPPED)")
-    elif no_linkable:
-        L.append("Gate A (mentions_total > 0): PASS")
-        L.append("Gate B (candidates_total > 0): PASS (NO_LINKABLE_MENTIONS)")
-        L.append("Gate C (linked_total > 0): PASS (NO_LINKABLE_MENTIONS)")
-    else:
-        L.append(f"Gate A (mentions_total > 0): {'PASS' if gate_a else 'FAIL'}")
-        L.append(f"Gate B (candidates_total > 0): {'PASS' if gate_b else 'FAIL'}")
-        L.append(f"Gate C (linked_total > 0): {'PASS' if gate_c else 'FAIL'}")
-
-    L.append(f"Gate D (no type-mismatch auto-links): {'PASS' if gate_d else 'FAIL'}")
-    L.append(f"Gate E (referential integrity): {'PASS' if gate_e else 'FAIL'}")
-    L.append(f"Gate F (evidence spans present): {'PASS' if gate_f else 'FAIL'}")
-    L.append(f"Gate G (candidates when linkable > 0): {'PASS' if gate_g else 'FAIL'}")
-    L.append(f"Gate H (no type-incompatible auto-links): {'PASS' if gate_h else 'FAIL'}")
-    L.append(f"AUDIT_4 (linking report DB-only): {'PASS' if audit_4_pass else 'FAIL'}")
-
-    all_pass = gate_a and gate_b and gate_c and gate_d and gate_e and gate_f and gate_g and gate_h and audit_4_pass
-
-    if no_entities_pass:
-        ready_status = "PASS_NO_LINKABLE_MENTIONS"
-    elif all_skipped:
-        ready_status = "PASS_ALL_QUALITY_SKIPPED"
-    elif no_linkable:
-        ready_status = "PASS_NO_LINKABLE_MENTIONS"
-    elif linked_total_val > 0 and all_pass:
-        ready_status = "PASS_AUDITED_LINKED"
-    elif linked_total_val > 0:
-        ready_status = "PASS_LINKED"
-    elif not has_strong_linkable:
-        ready_status = "PASS_ALL_QUALITY_SKIPPED"
-    else:
-        ready_status = "FAIL"
-
-    L.append(f"READY_STATUS: {ready_status}")
-
-    if ready_status == "FAIL":
-        failing = []
-        for name, val in [("A", gate_a), ("B", gate_b), ("C", gate_c),
-                          ("D", gate_d), ("E", gate_e), ("F", gate_f),
-                          ("G", gate_g), ("H", gate_h), ("AUDIT_4", audit_4_pass)]:
-            if not val:
-                failing.append(name)
-        L.append(f"Failing gates: {', '.join(failing)}")
-
-    return "\n".join(L)
+    return str(build_report_from_db(run_id).get("report") or "")
 
 
 def build_linking_report(result: dict[str, Any]) -> str:
-    """Build the chat-printable ENTITY LINKING REPORT string.
-
-    Five sections:
-    1. Summary stats (with separate API counters)
-    2. Top linked entities (max 10)
-    3. Failures/edge cases (max 10)
-    4. Type-mismatch detections (Gate D)
-    5. Validation summary with gates A–F
-    """
+    """Build a concise, scholar-facing authority summary."""
     L: list[str] = []
     run_id = result.get("run_id", "?")
     asset_ref = result.get("asset_ref", "?")
     mention_results = result.get("mention_results", [])
 
-    # ── Section 1: Summary ────────────────────────────────────────────
-    L.append("=== ENTITY LINKING REPORT ===")
+    L.append("=== AUTHORITY SUMMARY ===")
     L.append(f"run_id: {run_id}")
     L.append(f"asset_ref: {asset_ref}")
-    L.append(f"mentions_total: {result.get('mentions_total', 0)}")
-
-    type_counts = result.get("type_counts", {})
-    if type_counts:
-        parts = [f"{k}={v}" for k, v in sorted(type_counts.items())]
-        L.append(f"  by_type: {', '.join(parts)}")
-
-    L.append(f"candidates_total: {result.get('candidates_total', 0)}")
-    source_counts = result.get("source_counts", {})
+    L.append(
+        "summary: "
+        f"linked={result.get('linked_total', 0)}, "
+        f"unresolved={result.get('unresolved_total', 0)}, "
+        f"ambiguous={result.get('ambiguous_total', 0)}, "
+        f"mentions={result.get('mentions_total', 0)}"
+    )
+    source_counts = result.get("source_counts", {}) or {}
     if source_counts:
-        parts = [f"{k}={v}" for k, v in sorted(source_counts.items())]
-        L.append(f"  by_source: {', '.join(parts)}")
-
-    L.append(f"linked_total: {result.get('linked_total', 0)}")
-    L.append(f"unresolved_total: {result.get('unresolved_total', 0)}")
-    L.append(f"ambiguous_total: {result.get('ambiguous_total', 0)}")
-    L.append(f"skipped_total: {result.get('skipped_total', 0)}")
-    L.append(f"quality_skipped: {result.get('quality_skipped', 0)}")
-    L.append(f"canonical_matched: {result.get('canonical_matched', 0)}")
-    L.append(f"type_mismatch_count: {result.get('type_mismatch_count', 0)}")
-    L.append(f"api_calls_search: {result.get('api_calls_search', result.get('api_calls', 0))}")
-    L.append(f"api_calls_get: {result.get('api_calls_get', 0)}")
-    L.append(f"cache_hits: {result.get('cache_hits', 0)}")
-
-    # VIAF / GeoNames enrichment counts
-    viaf_found = sum(
-        1 for r in mention_results
-        if r.get("status") == "linked" and (r.get("selected") or {}).get("viaf_id")
-    )
-    geonames_found = sum(
-        1 for r in mention_results
-        if r.get("status") == "linked" and (r.get("selected") or {}).get("geonames_id")
-    )
-    L.append(f"viaf_found: {viaf_found}")
-    L.append(f"geonames_found: {geonames_found}")
-
-    L.append(f"ocr_quality: {result.get('ocr_quality', 'MEDIUM')}")
-    L.append(f"took_ms: {result.get('took_ms', 0)}")
+        L.append("sources: " + ", ".join(f"{k}={v}" for k, v in sorted(source_counts.items()) if v))
     L.append("")
 
-    # ── Section 2: Top Linked Entities ────────────────────────────────
     linked = [r for r in mention_results if r.get("status") == "linked"]
-    top_linked = sorted(linked, key=lambda r: (r.get("selected") or {}).get("score", 0), reverse=True)[:10]
-
-    L.append(f"=== TOP LINKED ENTITIES (N={len(top_linked)}) ===")
-    for r in top_linked:
-        sel = r.get("selected") or {}
-        L.append(f"  mention_id: {r.get('mention_id', '?')}")
-        L.append(f"  surface: \"{r.get('surface', '')}\"")
-        L.append(f"  ent_type: {r.get('ent_type', '?')}")
-        qa = r.get("queries_attempted") or [r.get("surface", "?")]
-        L.append(f"  queries_attempted: {qa}")
-        # Per-query diagnostics
-        for qd in (r.get("query_details") or []):
-            L.append(f"    query: {qd['query']}  cache_status={qd['cache_status']}  wikidata_called={qd['wikidata_called']}")
-            for rh in qd.get("raw_hits", []):
-                L.append(f"      raw_hit #{rh.get('search_rank',0)}: {rh.get('qid','')} | {rh.get('label','')} | {rh.get('description','')[:60]}")
-        L.append(f"  chunk_id: {r.get('chunk_id', '?')}  offsets: {r.get('start_offset', 0)}-{r.get('end_offset', 0)}")
-        L.append(f"  evidence: \"{r.get('evidence_text', '')}\"")
-        L.append(f"  → Wikidata: {sel.get('qid', '?')} | {sel.get('label', '?')} | {sel.get('description', '')}")
-        viaf = sel.get("viaf_id", "")
-        geo = sel.get("geonames_id", "")
-        if viaf or geo:
-            L.append(f"    VIAF: {viaf or '—'}  GeoNames: {geo or '—'}")
-        L.append(f"    score: {sel.get('score', 0):.4f}")
-        L.append("")
+    top_linked = sorted(linked, key=lambda r: (r.get("selected") or {}).get("score", 0), reverse=True)[:6]
+    L.append(f"=== LINKED ENTITIES ({len(top_linked)}) ===")
     if not top_linked:
-        L.append("  (none)")
-        L.append("")
-
-    # ── Section 2b: Mention Quality Decisions ─────────────────────────
-    skipped = [r for r in mention_results if r.get("status") == "skipped"]
-    canonical = [r for r in mention_results if r.get("canonical_match")]
-    L.append(f"=== MENTION QUALITY DECISIONS (skipped={len(skipped)}, canonical={len(canonical)}) ===")
-    for r in skipped[:10]:
-        L.append(f"  SKIP  surface=\"{r.get('surface', '')}\" ent_type={r.get('ent_type', '?')}")
-        L.append(f"        reason: {r.get('reason', '?')}")
-        nl = r.get("name_likeness")
-        if nl is not None:
-            L.append(f"        name_likeness: {nl:.3f}")
-    for r in canonical[:10]:
-        cm = r.get("canonical_match") or {}
-        L.append(f"  CANON surface=\"{r.get('surface', '')}\" → {cm.get('canon', '?')} (dist={cm.get('dist', '?')})")
-        nl = r.get("name_likeness")
-        if nl is not None:
-            L.append(f"        name_likeness: {nl:.3f}")
-    if not skipped and not canonical:
-        L.append("  (none)")
+        L.append("- none")
+    else:
+        for r in top_linked:
+            sel = r.get("selected") or {}
+            ids = [
+                f"{sel.get('source', 'authority')}:{sel.get('authority_id') or sel.get('qid', '')}",
+                f"wikidata={sel.get('qid', '')}" if sel.get("qid") else "",
+                f"viaf={sel.get('viaf_id', '')}" if sel.get("viaf_id") else "",
+                f"geonames={sel.get('geonames_id', '')}" if sel.get("geonames_id") else "",
+            ]
+            ids = [item for item in ids if item]
+            L.append(
+                f"- {r.get('surface', '')} -> {sel.get('label', '?')} "
+                f"[{r.get('ent_type', '?')}] | confidence={float(sel.get('score', 0.0)):.2f}"
+            )
+            L.append(f"  source_ids: {', '.join(ids)}")
+            L.append(
+                f"  evidence: chunk={r.get('chunk_id', '?')} offsets={r.get('start_offset', 0)}-{r.get('end_offset', 0)} "
+                f'text="{str(r.get("evidence_text", ""))[:120]}"'
+            )
     L.append("")
 
-    # ── Section 3: Failures/Edge Cases ────────────────────────────────
-    failures = [r for r in mention_results if r.get("status") in ("unresolved", "ambiguous")]
-    top_failures = failures[:10]
-
-    L.append(f"=== FAILURE/EDGE CASES (N={len(top_failures)}) ===")
-    for r in top_failures:
-        L.append(f"  mention_id: {r.get('mention_id', '?')}")
-        L.append(f"  surface: \"{r.get('surface', '')}\"")
-        L.append(f"  ent_type: {r.get('ent_type', '?')}")
-        qa = r.get("queries_attempted") or [r.get("surface", "?")]
-        L.append(f"  queries_attempted: {qa}")
-        # Per-query diagnostics
-        for qd in (r.get("query_details") or []):
-            L.append(f"    query: {qd['query']}  cache_status={qd['cache_status']}  wikidata_called={qd['wikidata_called']}")
-            for rh in qd.get("raw_hits", []):
-                L.append(f"      raw_hit #{rh.get('search_rank',0)}: {rh.get('qid','')} | {rh.get('label','')} | {rh.get('description','')[:60]}")
-        L.append(f"  status: {r.get('status', '?')}")
-        L.append(f"  reason: {r.get('reason', '?')}")
-        top2 = r.get("top_candidates", [])[:2]
-        for i, c in enumerate(top2, 1):
-            tc_flag = "✓" if c.get("type_compatible", False) else "✗"
-            L.append(f"    candidate_{i}: {c.get('qid', '?')} | {c.get('label', '?')} | score={c.get('score', 0):.4f} type={tc_flag}")
-        L.append("")
+    failures = [
+        r for r in mention_results
+        if _is_unresolved_status(r.get("status", "")) or r.get("status") == "ambiguous"
+    ]
+    top_failures = failures[:6]
+    L.append(f"=== UNRESOLVED OR AMBIGUOUS ({len(top_failures)}) ===")
     if not top_failures:
-        L.append("  (none)")
-        L.append("")
-
-    # ── Section 4: Type-Mismatch Detections ───────────────────────────
-    type_mismatches: list[dict[str, Any]] = []
-    for r in mention_results:
-        top_cands = r.get("top_candidates", [])
-        for c in top_cands:
-            if not c.get("type_compatible", True):
-                type_mismatches.append({
-                    "surface": r.get("surface", ""),
-                    "ent_type": r.get("ent_type", "?"),
-                    "qid": c.get("qid", "?"),
-                    "label": c.get("label", "?"),
-                    "score": c.get("score", 0),
-                })
-    tm_preview = type_mismatches[:10]
-    L.append(f"=== TYPE-MISMATCH DETECTIONS (N={len(type_mismatches)}) ===")
-    for tm in tm_preview:
-        L.append(
-            f"  surface=\"{tm['surface']}\" ent_type={tm['ent_type']} "
-            f"→ {tm['qid']} | {tm['label']} | score={tm['score']:.4f} [REJECTED]"
-        )
-    if not tm_preview:
-        L.append("  (none)")
-    L.append("")
-
-    # ── Section 5: Validation Summary ─────────────────────────────────
-    mentions_total = result.get("mentions_total", 0)
-    candidates_total = result.get("candidates_total", 0)
-    linked_total_val = result.get("linked_total", 0)
-    skipped_total_val = result.get("skipped_total", 0)
-    canonical_matched_val = result.get("canonical_matched", 0)
-
-    # Check for NO_ENTITIES_PRESENT condition
-    no_entities_pass = False
-    if mentions_total == 0:
-        base_text = result.get("_base_text", "")
-        if base_text:
-            from app.routers.ocr import _has_entity_cues
-            has_cues = _has_entity_cues(base_text)
-        else:
-            has_cues = False
-        if not has_cues:
-            no_entities_pass = True
-
-    # ALL_SKIPPED: every mention was quality-skipped (no linkable mentions)
-    all_skipped = (
-        mentions_total > 0
-        and skipped_total_val == mentions_total
-    )
-
-    # Req 4: Determine if there are "strong" linkable mentions.
-    # A mention is "strong" if it was NOT skipped AND satisfies:
-    #   - canonical_match is present, OR
-    #   - name_likeness >= 0.60 (for person/place), OR
-    #   - confidence >= 0.60
-    # Gate C is only enforced when strong linkable mentions exist.
-    has_strong_linkable = any(
-        r.get("canonical_match") is not None
-        or (r.get("name_likeness") or 0.0) >= 0.60
-        for r in mention_results
-        if r.get("status") != "skipped"
-    )
-
-    # NO_LINKABLE_MENTIONS: mentions exist but none are strong enough
-    # (only applies when linked_total == 0; if anything linked, it's clearly linkable)
-    no_linkable = (
-        mentions_total > 0
-        and linked_total_val == 0
-        and not all_skipped
-        and not has_strong_linkable
-    )
-
-    if no_entities_pass:
-        gate_a = True
-        gate_b = True
-        gate_c = True
-    elif all_skipped:
-        # All mentions were garbage → no candidates expected → pass B/C
-        gate_a = True
-        gate_b = True
-        gate_c = True
-    elif no_linkable:
-        # Mentions exist but none are strong → pass with NO_LINKABLE_MENTIONS
-        gate_a = True
-        gate_b = True
-        gate_c = True
+        L.append("- none")
     else:
-        gate_a = mentions_total > 0
-        # Gate B: pass if candidates exist OR canonical entities resolved
-        gate_b = candidates_total > 0 or canonical_matched_val > 0
-        gate_c = linked_total_val > 0
-
-    # Gate D: type-mismatch guard (PASS when no mismatches auto-selected)
-    gate_d = all(
-        r.get("status") != "linked"
-        or (r.get("selected") or {}).get("type_compatible", True) is not False
-        for r in mention_results
-    ) if mention_results else True
-
-    # Gate E: referential integrity (all mention_ids in results exist)
-    mention_ids_in_results = {r.get("mention_id") for r in mention_results}
-    gate_e = (
-        len(mention_ids_in_results) == mentions_total
-        and all(r.get("mention_id") for r in mention_results)
-    ) if mentions_total > 0 else True
-
-    # Gate F: every linked entity has evidence text
-    gate_f = all(
-        bool(r.get("evidence_text", "").strip())
-        for r in mention_results
-        if r.get("status") == "linked"
-    )
-
-    # Gate G: api_calls_search + api_calls_get > 0 when linkable mentions > 0
-    # BUT: if no linkable mentions exist, Gate G passes automatically.
-    gate_g = True
-    linkable_mentions = mentions_total - skipped_total_val
-    if linkable_mentions > 0 and not no_linkable:
-        total_api = int(result.get("api_calls_search", 0)) + int(result.get("api_calls_get", 0))
-        if total_api == 0:
-            gate_g = False
-
-    # Gate H: no auto-linked entity may have type_compatible=false
-    gate_h = all(
-        r.get("status") != "linked"
-        or (r.get("selected") or {}).get("type_compatible", True) is not False
-        for r in mention_results
-    ) if mention_results else True
-
-    L.append("=== VALIDATION SUMMARY ===")
-
-    # ── Compute READY_STATUS (explicit, replacing ambiguous labels) ────
-    # mentions_linkable_total = mentions that were NOT quality-skipped
-    mentions_linkable = mentions_total - skipped_total_val
-
-    L.append(f"mentions_total: {mentions_total}")
-    L.append(f"mentions_linkable_total: {mentions_linkable}")
-    L.append(f"mentions_skipped_total: {skipped_total_val}")
-    L.append(f"ocr_quality: {result.get('ocr_quality', 'MEDIUM')}")
-
-    if no_entities_pass:
-        L.append("Gate A (mentions_total > 0): PASS (NO_ENTITIES_PRESENT)")
-        L.append("Gate B (wikidata_candidates_total > 0): PASS (NO_ENTITIES_PRESENT)")
-        L.append("Gate C (linked_total > 0): PASS (NO_ENTITIES_PRESENT)")
-    elif all_skipped:
-        L.append("Gate A (mentions_total > 0): PASS (PASS_NO_LINKABLE_MENTIONS)")
-        L.append("Gate B (wikidata_candidates_total > 0): PASS (PASS_NO_LINKABLE_MENTIONS)")
-        L.append("Gate C (linked_total > 0): PASS (PASS_NO_LINKABLE_MENTIONS)")
-    elif no_linkable:
-        L.append("Gate A (mentions_total > 0): PASS")
-        L.append("Gate B (wikidata_candidates_total > 0): PASS (NO_LINKABLE_MENTIONS)")
-        L.append("Gate C (linked_total > 0): PASS (NO_LINKABLE_MENTIONS)")
-    else:
-        L.append(f"Gate A (mentions_total > 0): {'PASS' if gate_a else 'FAIL'}")
-        gate_b_detail = ""
-        if gate_b and candidates_total == 0 and canonical_matched_val > 0:
-            gate_b_detail = " (CANONICAL_MATCH)"
-        L.append(f"Gate B (wikidata_candidates_total > 0): {'PASS' if gate_b else 'FAIL'}{gate_b_detail}")
-        L.append(f"Gate C (linked_total > 0): {'PASS' if gate_c else 'FAIL'}")
-    L.append(f"Gate D (no type-mismatch auto-links): {'PASS' if gate_d else 'FAIL'}")
-    L.append(f"Gate E (referential integrity): {'PASS' if gate_e else 'FAIL'}")
-    L.append(f"Gate F (evidence spans present): {'PASS' if gate_f else 'FAIL'}")
-    L.append(f"Gate G (api_calls > 0 when mentions > 0): {'PASS' if gate_g else 'FAIL'}")
-    L.append(f"Gate H (no type-incompatible auto-links): {'PASS' if gate_h else 'FAIL'}")
-
-    all_pass = gate_a and gate_b and gate_c and gate_d and gate_e and gate_f and gate_g and gate_h
-
-    # ── Determine READY_STATUS ────────────────────────────────────────
-    # PASS_LINKED                : at least one entity linked
-    # PASS_ALL_QUALITY_SKIPPED   : only role/low-quality mentions (no strong ones)
-    # PASS_NO_LINKABLE_MENTIONS  : no mentions, no entity cues, or no strong linkable mentions
-    # FAIL                       : at least one strong mention (canonicalized or
-    #                              conf>=0.60) exists but linked_total==0
-
-    if no_entities_pass:
-        ready_status = "PASS_NO_LINKABLE_MENTIONS"
-        L.append(f"READY_STATUS: {ready_status}")
-    elif all_skipped:
-        ready_status = "PASS_ALL_QUALITY_SKIPPED"
-        L.append(f"READY_STATUS: {ready_status}")
-    elif no_linkable:
-        ready_status = "PASS_NO_LINKABLE_MENTIONS"
-        L.append(f"READY_STATUS: {ready_status}")
-    elif linked_total_val > 0:
-        ready_status = "PASS_LINKED"
-        L.append(f"READY_STATUS: {ready_status}")
-    elif not has_strong_linkable:
-        # No strong mentions and nothing linked → still OK
-        ready_status = "PASS_ALL_QUALITY_SKIPPED"
-        L.append(f"READY_STATUS: {ready_status}")
-    else:
-        ready_status = "FAIL"
-        L.append(f"READY_STATUS: {ready_status}")
-        failing = []
-        if not gate_a:
-            failing.append("A")
-        if not gate_b:
-            failing.append("B")
-        if not gate_c:
-            failing.append("C")
-        if not gate_d:
-            failing.append("D")
-        if not gate_e:
-            failing.append("E")
-        if not gate_f:
-            failing.append("F")
-        if not gate_g:
-            failing.append("G")
-        if not gate_h:
-            failing.append("H")
-        L.append(f"Failing gates: {', '.join(failing)}")
-
+        for r in top_failures:
+            display_type = _display_probable_type(
+                str(r.get("ent_type") or ""),
+                str(r.get("reason") or ""),
+                str(r.get("surface") or ""),
+            )
+            L.append(
+                f"- {r.get('surface', '')} [{display_type or '?'}] | "
+                f"status={r.get('status', '?')} | reason={_summarize_authority_reason(str(r.get('reason', '')), str(r.get('surface', '')), display_type or str(r.get('ent_type', '')))}"
+            )
+            top_candidate = (r.get("top_candidates") or [{}])[0]
+            if top_candidate and any(top_candidate.values()):
+                candidate_id = top_candidate.get("authority_id") or top_candidate.get("qid", "")
+                L.append(
+                    f"  top_candidate: {top_candidate.get('source', 'authority')}:{candidate_id} "
+                    f"| {top_candidate.get('label', '?')} | score={float(top_candidate.get('score', 0.0)):.2f}"
+                )
+            L.append(
+                f"  evidence: chunk={r.get('chunk_id', '?')} offsets={r.get('start_offset', 0)}-{r.get('end_offset', 0)} "
+                f'text="{str(r.get("evidence_text", ""))[:120]}"'
+            )
     return "\n".join(L)

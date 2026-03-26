@@ -34,13 +34,18 @@ class Settings(BaseSettings):
     chat_ai_base_url: str = "https://chat-ai.academiccloud.de/v1"
     archai_chat_ai_api_key: str = ""
     archai_chat_ai_base_url: str = "https://chat-ai.academiccloud.de/v1"
-    archai_chat_ai_model: str = "internvl3.5-30b-a3b"
+    archai_chat_ai_model: str = "qwen3-30b-a3b-instruct-2507"
+    chat_rag_model: str = "qwen3-30b-a3b-instruct-2507"
+    translation_model: str = "llama-3.3-70b-instruct"
 
     # SAIA OCR Agent configuration
     saia_api_key: str = ""
     saia_base_url: str = "https://chat-ai.academiccloud.de/v1"
     saia_timeout_seconds: int = 120
     saia_models_cache_ttl_seconds: int = 300
+    saia_label_analysis_model: str = "qwen3-vl-30b-a3b-instruct"
+    label_visual_model: str = "qwen3-vl-30b-a3b-instruct"
+    label_visual_fallback_model: str = "internvl3.5-30b-a3b"
     saia_ocr_model_preferences: str = ""
     saia_ocr_model_prefs: str = ""
     saia_ocr_models: str = ""
@@ -60,9 +65,22 @@ class Settings(BaseSettings):
         os.path.dirname(os.path.dirname(__file__)), ".data", "chroma"
     )
     rag_collection_name: str = "archai_chunks"
-    rag_embedding_model: str = ""
+    rag_entity_collection_name: str = "archai_entities"
+    rag_embedding_model: str = "multilingual-e5-large-instruct"
     rag_top_k: int = 5
-    rag_auto_index: bool = False
+    rag_entity_top_k: int = 4
+    rag_auto_index: bool = True
+
+    # Authority source expansion
+    geonames_base_url: str = "http://api.geonames.org"
+    geonames_username: str = "demo"
+    geonames_timeout_seconds: int = 10
+
+    # Paleography verification
+    paleography_verification_enabled: bool = True
+    paleography_verification_model: str = "qwen3-235b-a22b"
+    paleography_verification_temperature: float = 0.0
+    paleography_verification_max_tokens: int = 900
 
     # OCR backend routing
     ocr_backend_default: str = "auto"
@@ -90,6 +108,12 @@ class Settings(BaseSettings):
 
     # GLM-OCR (self-hosted mode)
     glmocr_device: str = "0"
+    glmocr_ollama_host: str = "http://localhost:11434"
+    glmocr_ollama_model: str = "glm-ocr:latest"
+    glmocr_ollama_timeout_seconds: int = 300
+    glmocr_ollama_temperature: float = 0.0
+    glmocr_ollama_retries_per_variant: int = 2
+    glmocr_max_payload_bytes: int = 2000000
 
     @property
     def cors_origins_list(self) -> list[str]:

@@ -287,6 +287,116 @@ def _init_db_if_needed() -> None:
                 );
 
                 CREATE INDEX IF NOT EXISTS idx_ocr_benchmark_references_run_id ON ocr_benchmark_references(run_id);
+
+                CREATE TABLE IF NOT EXISTS authority_entities (
+                    entity_id TEXT PRIMARY KEY,
+                    authority_source TEXT NOT NULL,
+                    authority_id TEXT NOT NULL,
+                    wikidata_qid TEXT NULL,
+                    viaf_id TEXT NULL,
+                    geonames_id TEXT NULL,
+                    canonical_label TEXT NOT NULL,
+                    normalized_label TEXT NULL,
+                    entity_type TEXT NULL,
+                    description TEXT NULL,
+                    lat REAL NULL,
+                    lon REAL NULL,
+                    country_name TEXT NULL,
+                    admin1_name TEXT NULL,
+                    parent_location TEXT NULL,
+                    meta_json TEXT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_authority_entities_source_id
+                    ON authority_entities(authority_source, authority_id);
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_authority_entities_wikidata_qid
+                    ON authority_entities(wikidata_qid)
+                    WHERE wikidata_qid IS NOT NULL AND wikidata_qid != '';
+
+                CREATE TABLE IF NOT EXISTS authority_aliases (
+                    alias_id TEXT PRIMARY KEY,
+                    entity_id TEXT NOT NULL,
+                    alias TEXT NOT NULL,
+                    normalized_alias TEXT NOT NULL,
+                    alias_lang TEXT NULL,
+                    alias_source TEXT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    FOREIGN KEY(entity_id) REFERENCES authority_entities(entity_id) ON DELETE CASCADE
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_authority_aliases_entity_id ON authority_aliases(entity_id);
+                CREATE INDEX IF NOT EXISTS idx_authority_aliases_norm ON authority_aliases(normalized_alias);
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_authority_aliases_unique
+                    ON authority_aliases(entity_id, normalized_alias, alias_source);
+
+                CREATE TABLE IF NOT EXISTS authority_source_assertions (
+                    assertion_id TEXT PRIMARY KEY,
+                    entity_id TEXT NOT NULL,
+                    source_name TEXT NOT NULL,
+                    property_name TEXT NOT NULL,
+                    property_value TEXT NULL,
+                    source_json TEXT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    FOREIGN KEY(entity_id) REFERENCES authority_entities(entity_id) ON DELETE CASCADE
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_authority_assertions_entity_id ON authority_source_assertions(entity_id);
+                CREATE INDEX IF NOT EXISTS idx_authority_assertions_source ON authority_source_assertions(source_name);
+
+                CREATE TABLE IF NOT EXISTS evidence_spans (
+                    span_id TEXT PRIMARY KEY,
+                    run_id TEXT NOT NULL,
+                    asset_ref TEXT NULL,
+                    page_id TEXT NULL,
+                    chunk_id TEXT NULL,
+                    mention_id TEXT NULL,
+                    start_offset INTEGER NULL,
+                    end_offset INTEGER NULL,
+                    bbox_json TEXT NULL,
+                    polygon_json TEXT NULL,
+                    crop_sha256 TEXT NULL,
+                    ocr_model TEXT NULL,
+                    prompt_version TEXT NULL,
+                    raw_text TEXT NOT NULL,
+                    normalized_text TEXT NULL,
+                    meta_json TEXT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    FOREIGN KEY(run_id) REFERENCES pipeline_runs(run_id) ON DELETE CASCADE,
+                    FOREIGN KEY(chunk_id) REFERENCES chunks(chunk_id) ON DELETE SET NULL,
+                    FOREIGN KEY(mention_id) REFERENCES entity_mentions(mention_id) ON DELETE SET NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_evidence_spans_run_id ON evidence_spans(run_id);
+                CREATE INDEX IF NOT EXISTS idx_evidence_spans_page_id ON evidence_spans(page_id);
+                CREATE INDEX IF NOT EXISTS idx_evidence_spans_chunk_id ON evidence_spans(chunk_id);
+                CREATE INDEX IF NOT EXISTS idx_evidence_spans_mention_id ON evidence_spans(mention_id);
+
+                CREATE TABLE IF NOT EXISTS mention_links (
+                    link_id TEXT PRIMARY KEY,
+                    mention_id TEXT NOT NULL UNIQUE,
+                    entity_id TEXT NULL,
+                    confidence REAL NULL,
+                    link_status TEXT NOT NULL,
+                    selected_by TEXT NULL,
+                    type_compatible INTEGER NULL,
+                    score_breakdown_json TEXT NULL,
+                    evidence_span_id TEXT NULL,
+                    reason TEXT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    FOREIGN KEY(mention_id) REFERENCES entity_mentions(mention_id) ON DELETE CASCADE,
+                    FOREIGN KEY(entity_id) REFERENCES authority_entities(entity_id) ON DELETE SET NULL,
+                    FOREIGN KEY(evidence_span_id) REFERENCES evidence_spans(span_id) ON DELETE SET NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_mention_links_entity_id ON mention_links(entity_id);
+                CREATE INDEX IF NOT EXISTS idx_mention_links_status ON mention_links(link_status);
+                CREATE INDEX IF NOT EXISTS idx_mention_links_evidence_span_id ON mention_links(evidence_span_id);
                 """
             )
             _ensure_run_columns(conn)
@@ -363,6 +473,17 @@ def _row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
             except Exception:
                 pass
     return data
+
+
+def _json_string_or_none(value: Any) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return value
+    try:
+        return json.dumps(value, ensure_ascii=False)
+    except Exception:
+        return None
 
 
 def create_run(asset_ref: str, asset_sha256: str | None = None) -> str:
@@ -491,8 +612,10 @@ def table_view_for_events(run_id: str) -> dict[str, Any]:
 def clear_analysis_for_run(run_id: str) -> None:
     _init_db_if_needed()
     with _connect() as conn:
+        conn.execute("DELETE FROM mention_links WHERE mention_id IN (SELECT mention_id FROM entity_mentions WHERE run_id=?)", (run_id,))
         conn.execute("DELETE FROM entity_attempts WHERE decision_id IN (SELECT decision_id FROM entity_decisions WHERE run_id=?)", (run_id,))
         conn.execute("DELETE FROM entity_candidates WHERE mention_id IN (SELECT mention_id FROM entity_mentions WHERE run_id=?)", (run_id,))
+        conn.execute("DELETE FROM evidence_spans WHERE run_id=?", (run_id,))
         conn.execute("DELETE FROM entity_mentions WHERE run_id=?", (run_id,))
         conn.execute("DELETE FROM entity_decisions WHERE run_id=?", (run_id,))
         conn.execute("DELETE FROM chunks WHERE run_id=?", (run_id,))
@@ -706,6 +829,447 @@ def table_view_for_entity_candidates(run_id: str) -> dict[str, Any]:
         ).fetchall()
     values = [[row[col] for col in columns] for row in rows]
     return {"table": "entity_candidates", "columns": columns, "rows": values}
+
+
+# ── Authority entity layer ────────────────────────────────────────────
+
+
+def upsert_authority_entity(row: dict[str, Any]) -> dict[str, Any]:
+    _init_db_if_needed()
+    ts = now_iso()
+    authority_source = str(row.get("authority_source") or ("wikidata" if row.get("wikidata_qid") else "unknown")).strip() or "unknown"
+    authority_id = str(
+        row.get("authority_id")
+        or row.get("wikidata_qid")
+        or row.get("viaf_id")
+        or row.get("geonames_id")
+        or uuid.uuid4()
+    ).strip()
+    if not authority_id:
+        authority_id = str(uuid.uuid4())
+    entity_id = str(row.get("entity_id") or f"{authority_source}:{authority_id}").strip() or f"{authority_source}:{authority_id}"
+    record = {
+        "entity_id": entity_id,
+        "authority_source": authority_source,
+        "authority_id": authority_id,
+        "wikidata_qid": str(row.get("wikidata_qid") or "").strip() or None,
+        "viaf_id": str(row.get("viaf_id") or "").strip() or None,
+        "geonames_id": str(row.get("geonames_id") or "").strip() or None,
+        "canonical_label": str(row.get("canonical_label") or row.get("label") or authority_id).strip() or authority_id,
+        "normalized_label": str(row.get("normalized_label") or "").strip() or None,
+        "entity_type": str(row.get("entity_type") or "").strip() or None,
+        "description": str(row.get("description") or "").strip() or None,
+        "lat": row.get("lat"),
+        "lon": row.get("lon"),
+        "country_name": str(row.get("country_name") or "").strip() or None,
+        "admin1_name": str(row.get("admin1_name") or "").strip() or None,
+        "parent_location": str(row.get("parent_location") or "").strip() or None,
+        "meta_json": _json_string_or_none(row.get("meta_json")),
+        "created_at": ts,
+        "updated_at": ts,
+    }
+    with _connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO authority_entities (
+                entity_id, authority_source, authority_id, wikidata_qid, viaf_id, geonames_id,
+                canonical_label, normalized_label, entity_type, description,
+                lat, lon, country_name, admin1_name, parent_location, meta_json,
+                created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(entity_id) DO UPDATE SET
+                authority_source=excluded.authority_source,
+                authority_id=excluded.authority_id,
+                wikidata_qid=excluded.wikidata_qid,
+                viaf_id=excluded.viaf_id,
+                geonames_id=excluded.geonames_id,
+                canonical_label=excluded.canonical_label,
+                normalized_label=excluded.normalized_label,
+                entity_type=excluded.entity_type,
+                description=excluded.description,
+                lat=excluded.lat,
+                lon=excluded.lon,
+                country_name=excluded.country_name,
+                admin1_name=excluded.admin1_name,
+                parent_location=excluded.parent_location,
+                meta_json=excluded.meta_json,
+                updated_at=excluded.updated_at
+            """,
+            (
+                record["entity_id"],
+                record["authority_source"],
+                record["authority_id"],
+                record["wikidata_qid"],
+                record["viaf_id"],
+                record["geonames_id"],
+                record["canonical_label"],
+                record["normalized_label"],
+                record["entity_type"],
+                record["description"],
+                record["lat"],
+                record["lon"],
+                record["country_name"],
+                record["admin1_name"],
+                record["parent_location"],
+                record["meta_json"],
+                record["created_at"],
+                record["updated_at"],
+            ),
+        )
+        conn.commit()
+    return record
+
+
+def replace_authority_aliases(entity_id: str, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    _init_db_if_needed()
+    try:
+        from app.services.wikidata_client import normalise_surface as _normalize_alias
+    except Exception:  # pragma: no cover
+        _normalize_alias = lambda value: " ".join(str(value or "").lower().split())
+
+    ts = now_iso()
+    inserted: list[dict[str, Any]] = []
+    seen: set[tuple[str, str | None]] = set()
+    with _connect() as conn:
+        conn.execute("DELETE FROM authority_aliases WHERE entity_id=?", (entity_id,))
+        for row in rows:
+            alias = str(row.get("alias") or "").strip()
+            if not alias:
+                continue
+            normalized_alias = str(row.get("normalized_alias") or _normalize_alias(alias)).strip()
+            alias_source = str(row.get("alias_source") or "").strip() or None
+            dedupe_key = (normalized_alias, alias_source)
+            if dedupe_key in seen:
+                continue
+            seen.add(dedupe_key)
+            alias_id = str(row.get("alias_id") or uuid.uuid4())
+            alias_lang = str(row.get("alias_lang") or "").strip() or None
+            conn.execute(
+                """
+                INSERT INTO authority_aliases (
+                    alias_id, entity_id, alias, normalized_alias, alias_lang, alias_source, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (alias_id, entity_id, alias, normalized_alias, alias_lang, alias_source, ts, ts),
+            )
+            inserted.append(
+                {
+                    "alias_id": alias_id,
+                    "entity_id": entity_id,
+                    "alias": alias,
+                    "normalized_alias": normalized_alias,
+                    "alias_lang": alias_lang,
+                    "alias_source": alias_source,
+                    "created_at": ts,
+                    "updated_at": ts,
+                }
+            )
+        conn.commit()
+    return inserted
+
+
+def replace_authority_source_assertions(entity_id: str, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    _init_db_if_needed()
+    ts = now_iso()
+    inserted: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, str]] = set()
+    with _connect() as conn:
+        conn.execute("DELETE FROM authority_source_assertions WHERE entity_id=?", (entity_id,))
+        for row in rows:
+            source_name = str(row.get("source_name") or "").strip()
+            property_name = str(row.get("property_name") or "").strip()
+            property_value = str(row.get("property_value") or "").strip()
+            if not source_name or not property_name:
+                continue
+            dedupe_key = (source_name, property_name, property_value)
+            if dedupe_key in seen:
+                continue
+            seen.add(dedupe_key)
+            assertion_id = str(row.get("assertion_id") or uuid.uuid4())
+            source_json = _json_string_or_none(row.get("source_json"))
+            conn.execute(
+                """
+                INSERT INTO authority_source_assertions (
+                    assertion_id, entity_id, source_name, property_name, property_value, source_json, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (assertion_id, entity_id, source_name, property_name, property_value or None, source_json, ts, ts),
+            )
+            inserted.append(
+                {
+                    "assertion_id": assertion_id,
+                    "entity_id": entity_id,
+                    "source_name": source_name,
+                    "property_name": property_name,
+                    "property_value": property_value or None,
+                    "source_json": source_json,
+                    "created_at": ts,
+                    "updated_at": ts,
+                }
+            )
+        conn.commit()
+    return inserted
+
+
+def upsert_evidence_span(row: dict[str, Any]) -> dict[str, Any]:
+    _init_db_if_needed()
+    ts = now_iso()
+    raw_text = str(row.get("raw_text") or row.get("text") or "").strip()
+    normalized_text = str(row.get("normalized_text") or raw_text).strip() or None
+    seed = "|".join(
+        [
+            str(row.get("run_id") or ""),
+            str(row.get("asset_ref") or ""),
+            str(row.get("page_id") or ""),
+            str(row.get("chunk_id") or ""),
+            str(row.get("mention_id") or ""),
+            str(row.get("start_offset") or ""),
+            str(row.get("end_offset") or ""),
+            raw_text,
+        ]
+    )
+    span_id = str(row.get("span_id") or f"span-{uuid.uuid5(uuid.NAMESPACE_URL, seed)}")
+    record = {
+        "span_id": span_id,
+        "run_id": str(row.get("run_id") or "").strip(),
+        "asset_ref": str(row.get("asset_ref") or "").strip() or None,
+        "page_id": str(row.get("page_id") or "").strip() or None,
+        "chunk_id": str(row.get("chunk_id") or "").strip() or None,
+        "mention_id": str(row.get("mention_id") or "").strip() or None,
+        "start_offset": row.get("start_offset"),
+        "end_offset": row.get("end_offset"),
+        "bbox_json": _json_string_or_none(row.get("bbox_xyxy") or row.get("bbox")),
+        "polygon_json": _json_string_or_none(row.get("polygon")),
+        "crop_sha256": str(row.get("crop_sha256") or "").strip() or None,
+        "ocr_model": str(row.get("ocr_model") or row.get("model_used") or "").strip() or None,
+        "prompt_version": str(row.get("prompt_version") or "").strip() or None,
+        "raw_text": raw_text,
+        "normalized_text": normalized_text,
+        "meta_json": _json_string_or_none(row.get("meta_json")),
+        "created_at": ts,
+        "updated_at": ts,
+    }
+    with _connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO evidence_spans (
+                span_id, run_id, asset_ref, page_id, chunk_id, mention_id,
+                start_offset, end_offset, bbox_json, polygon_json,
+                crop_sha256, ocr_model, prompt_version, raw_text, normalized_text, meta_json,
+                created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(span_id) DO UPDATE SET
+                asset_ref=excluded.asset_ref,
+                page_id=excluded.page_id,
+                chunk_id=excluded.chunk_id,
+                mention_id=excluded.mention_id,
+                start_offset=excluded.start_offset,
+                end_offset=excluded.end_offset,
+                bbox_json=excluded.bbox_json,
+                polygon_json=excluded.polygon_json,
+                crop_sha256=excluded.crop_sha256,
+                ocr_model=excluded.ocr_model,
+                prompt_version=excluded.prompt_version,
+                raw_text=excluded.raw_text,
+                normalized_text=excluded.normalized_text,
+                meta_json=excluded.meta_json,
+                updated_at=excluded.updated_at
+            """,
+            (
+                record["span_id"],
+                record["run_id"],
+                record["asset_ref"],
+                record["page_id"],
+                record["chunk_id"],
+                record["mention_id"],
+                record["start_offset"],
+                record["end_offset"],
+                record["bbox_json"],
+                record["polygon_json"],
+                record["crop_sha256"],
+                record["ocr_model"],
+                record["prompt_version"],
+                record["raw_text"],
+                record["normalized_text"],
+                record["meta_json"],
+                record["created_at"],
+                record["updated_at"],
+            ),
+        )
+        conn.commit()
+    return record
+
+
+def list_evidence_spans(
+    *,
+    page_id: str | None = None,
+    run_id: str | None = None,
+    mention_id: str | None = None,
+    chunk_id: str | None = None,
+) -> list[dict[str, Any]]:
+    _init_db_if_needed()
+    sql = "SELECT * FROM evidence_spans WHERE 1=1"
+    params: list[Any] = []
+    if page_id is not None:
+        sql += " AND page_id=?"
+        params.append(page_id)
+    if run_id is not None:
+        sql += " AND run_id=?"
+        params.append(run_id)
+    if mention_id is not None:
+        sql += " AND mention_id=?"
+        params.append(mention_id)
+    if chunk_id is not None:
+        sql += " AND chunk_id=?"
+        params.append(chunk_id)
+    sql += " ORDER BY created_at ASC, span_id ASC"
+    with _connect() as conn:
+        rows = conn.execute(sql, params).fetchall()
+    results: list[dict[str, Any]] = []
+    for row in rows:
+        item = {key: row[key] for key in row.keys()}
+        for key in ("bbox_json", "polygon_json", "meta_json"):
+            value = item.get(key)
+            if isinstance(value, str):
+                try:
+                    item[key] = json.loads(value)
+                except Exception:
+                    pass
+        results.append(item)
+    return results
+
+
+def upsert_mention_link(row: dict[str, Any]) -> dict[str, Any]:
+    _init_db_if_needed()
+    mention_id = str(row.get("mention_id") or "").strip()
+    if not mention_id:
+        raise ValueError("mention_id is required for mention_links.")
+    ts = now_iso()
+    link_id = str(row.get("link_id") or f"link:{mention_id}")
+    confidence = row.get("confidence")
+    record = {
+        "link_id": link_id,
+        "mention_id": mention_id,
+        "entity_id": str(row.get("entity_id") or "").strip() or None,
+        "confidence": float(confidence) if confidence is not None else None,
+        "link_status": str(row.get("link_status") or "unresolved").strip() or "unresolved",
+        "selected_by": str(row.get("selected_by") or "").strip() or None,
+        "type_compatible": row.get("type_compatible"),
+        "score_breakdown_json": _json_string_or_none(row.get("score_breakdown_json") or row.get("score_breakdown")),
+        "evidence_span_id": str(row.get("evidence_span_id") or "").strip() or None,
+        "reason": str(row.get("reason") or "").strip() or None,
+        "created_at": ts,
+        "updated_at": ts,
+    }
+    type_compatible = record["type_compatible"]
+    type_compatible_db = None if type_compatible is None else (1 if bool(type_compatible) else 0)
+    with _connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO mention_links (
+                link_id, mention_id, entity_id, confidence, link_status, selected_by,
+                type_compatible, score_breakdown_json, evidence_span_id, reason, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(mention_id) DO UPDATE SET
+                entity_id=excluded.entity_id,
+                confidence=excluded.confidence,
+                link_status=excluded.link_status,
+                selected_by=excluded.selected_by,
+                type_compatible=excluded.type_compatible,
+                score_breakdown_json=excluded.score_breakdown_json,
+                evidence_span_id=excluded.evidence_span_id,
+                reason=excluded.reason,
+                updated_at=excluded.updated_at
+            """,
+            (
+                record["link_id"],
+                record["mention_id"],
+                record["entity_id"],
+                record["confidence"],
+                record["link_status"],
+                record["selected_by"],
+                type_compatible_db,
+                record["score_breakdown_json"],
+                record["evidence_span_id"],
+                record["reason"],
+                record["created_at"],
+                record["updated_at"],
+            ),
+        )
+        conn.commit()
+    record["type_compatible"] = None if type_compatible is None else bool(type_compatible)
+    return record
+
+
+def list_mention_links_for_run(run_id: str) -> list[dict[str, Any]]:
+    _init_db_if_needed()
+    sql = """
+        SELECT
+            l.link_id,
+            l.mention_id,
+            l.entity_id,
+            l.confidence,
+            l.link_status,
+            l.selected_by,
+            l.type_compatible,
+            l.score_breakdown_json,
+            l.evidence_span_id,
+            l.reason,
+            l.created_at,
+            l.updated_at,
+            m.run_id,
+            m.chunk_id,
+            m.start_offset,
+            m.end_offset,
+            m.surface,
+            m.norm,
+            m.label,
+            m.ent_type,
+            m.method,
+            m.notes,
+            e.authority_source,
+            e.authority_id,
+            e.wikidata_qid,
+            e.viaf_id,
+            e.geonames_id,
+            e.canonical_label,
+            e.entity_type,
+            e.description,
+            e.lat,
+            e.lon,
+            e.country_name,
+            e.admin1_name,
+            e.parent_location,
+            s.asset_ref,
+            s.page_id,
+            s.raw_text AS evidence_raw_text,
+            s.normalized_text AS evidence_normalized_text,
+            s.start_offset AS evidence_start_offset,
+            s.end_offset AS evidence_end_offset,
+            s.bbox_json,
+            s.polygon_json
+        FROM mention_links l
+        JOIN entity_mentions m ON m.mention_id = l.mention_id
+        LEFT JOIN authority_entities e ON e.entity_id = l.entity_id
+        LEFT JOIN evidence_spans s ON s.span_id = l.evidence_span_id
+        WHERE m.run_id=?
+        ORDER BY m.start_offset ASC, l.created_at ASC
+    """
+    with _connect() as conn:
+        rows = conn.execute(sql, (run_id,)).fetchall()
+    results: list[dict[str, Any]] = []
+    for row in rows:
+        item = {key: row[key] for key in row.keys()}
+        item["type_compatible"] = None if item.get("type_compatible") is None else bool(item.get("type_compatible"))
+        for key in ("score_breakdown_json", "bbox_json", "polygon_json"):
+            value = item.get(key)
+            if isinstance(value, str):
+                try:
+                    item[key] = json.loads(value)
+                except Exception:
+                    pass
+        results.append(item)
+    return results
 
 
 # ── entity_decisions CRUD ─────────────────────────────────────────────
