@@ -2822,6 +2822,12 @@ def _run_post_ocr_pipeline_for_glm(
     response: SaiaFullPageExtractResponse,
     image_bytes: bytes,
 ) -> dict[str, Any]:
+    """Persist live GLM OCR output and run quality-controlled analysis.
+
+    This stage receives text produced by the configured OCR runtime for the
+    current request. It records provenance before deciding which downstream
+    analysis, authority-linking, and indexing steps are appropriate.
+    """
     text_value = str(response.text or "").strip()
     if not text_value:
         return {}
@@ -2838,6 +2844,8 @@ def _run_post_ocr_pipeline_for_glm(
     log_event(run_id, "OCR_RUNNING", "START", "Running GLM full-page OCR post-processing pipeline.")
     update_run_fields(run_id, status="RUNNING", current_stage="OCR_RUNNING")
 
+    # Quality reports are persisted before downstream analysis so a completed
+    # trace explains why later stages ran normally, degraded, or were skipped.
     confidence_value = float(response.confidence or 0.0)
     raw_lines = list(response.lines or [line for line in text_value.splitlines() if line.strip()])
     quality_report = compute_quality_report(text_value, run_id=run_id, pass_idx=0)
@@ -2870,6 +2878,9 @@ def _run_post_ocr_pipeline_for_glm(
     log_event(run_id, "OCR_DONE", "END", "GLM full-page OCR text stored.")
 
     if not gate_decisions.get("ner_allowed", True):
+        # Preserve a traceable degraded result when OCR quality is too low for
+        # full entity extraction. This keeps the run inspectable without
+        # treating uncertain transcription as reliable semantic evidence.
         log_event(
             run_id,
             "ANALYZE_DEGRADED",
@@ -2924,6 +2935,9 @@ def _run_post_ocr_pipeline_for_glm(
     log_event(run_id, "STORED", "END", "Run results persisted in SQLite.")
     update_run_fields(run_id, current_stage="STORED", proofread_text=text_value)
 
+    # Authority linking and RAG indexing consume persisted OCR-derived mentions
+    # only when quality gates allow token search. Otherwise, deferred links are
+    # recorded so the decision remains visible in the run trace.
     authority_report: str | None = None
     if not gate_decisions.get("token_search_allowed", True):
         log_event(run_id, "LINKING_SKIPPED", "INFO", f"Authority linking SKIPPED: token_search_allowed=False (quality={quality_label})")
@@ -3474,11 +3488,14 @@ async def ocr_saia(payload: SaiaOCRRequest) -> SaiaOCRResponse:
 
 @router.post("/ocr/extract_full_page", response_model=SaiaFullPageExtractResponse)
 async def ocr_extract_full_page(payload: SaiaFullPageExtractRequest) -> SaiaFullPageExtractResponse:
+    """Run live full-page GLM OCR and attach persisted post-processing results."""
     try:
         image_bytes = decode_image_bytes(payload.image_b64 or "")
     except Exception as exc:
         raise HTTPException(status_code=422, detail=f"Invalid image_b64 payload: {exc}") from exc
     try:
+        # Document metadata contributes prompt context, while the current page
+        # image remains the source passed to the configured OCR runtime.
         glm_prompt = build_glm_ocr_prompt(
             language_hint=payload.language_hint,
             script_hint_seed=payload.script_hint_seed,
@@ -3502,6 +3519,8 @@ async def ocr_extract_full_page(payload: SaiaFullPageExtractRequest) -> SaiaFull
     except Exception as exc:  # pragma: no cover
         raise HTTPException(status_code=500, detail=f"Full-page OCR failed: {exc}") from exc
 
+    # Normalize the runtime response first, then run the shared persistence and
+    # trace stages without replacing the recognized text.
     response = _full_page_response_from_glm_ollama_result(result, payload)
     try:
         pipeline_fields = await asyncio.to_thread(
@@ -3574,6 +3593,8 @@ async def ocr_page_with_trace(payload: SaiaFullPageExtractRequest) -> dict[str, 
         )
         log_event(run_id, "RECEIVED", "INFO", "Stored benchmark/reference text for later OCR comparison.")
 
+    # Prefer caller-provided layout hints when available. Otherwise, derive
+    # suggestions from the submitted image so OCR can retain manuscript layout.
     location_suggestions = list(payload.location_suggestions)
     base_warnings: list[str] = []
     if not location_suggestions:
@@ -3588,6 +3609,8 @@ async def ocr_page_with_trace(payload: SaiaFullPageExtractRequest) -> dict[str, 
         log_event(run_id, "RECEIVED", "INFO",
                   f"Using provided location suggestions: {len(location_suggestions)}")
 
+    # Structured regions preserve page geometry and reading order. A second
+    # segmentation pass is attempted when suggestions cannot produce regions.
     structured_regions = list(payload.regions) or _regions_from_location_suggestions(location_suggestions)
     if not structured_regions and not payload.location_suggestions:
         try:
@@ -3599,6 +3622,9 @@ async def ocr_page_with_trace(payload: SaiaFullPageExtractRequest) -> dict[str, 
             log_event(run_id, "RECEIVED", "WARN", f"Structured region preparation failed: {exc}")
 
     if structured_regions:
+        # The segmented pipeline is the preferred path for manuscript pages:
+        # recognition operates on explicit text zones instead of an
+        # undifferentiated full-page image.
         try:
             return await _run_segmented_trace_pipeline(
                 run_id=run_id,

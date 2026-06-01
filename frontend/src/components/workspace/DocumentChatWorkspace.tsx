@@ -1652,6 +1652,10 @@ export function DocumentChatWorkspace({ initialDocumentId }: DocumentChatWorkspa
     }
   };
 
+  // Coordinates the browser-side OCR workflow for the selected manuscript
+  // page. Recognition and trace persistence remain backend responsibilities;
+  // this function sends the source image and reflects the returned state in
+  // the workspace chat.
   const handleExtractTextInChat = async (options?: {
     includeDebugOutput?: boolean;
     silent?: boolean;
@@ -1705,6 +1709,9 @@ export function DocumentChatWorkspace({ initialDocumentId }: DocumentChatWorkspa
     try {
       setExtractionStatus("Extraction status: running GLM OCR...");
 
+      // Prompt hints provide runtime context for script and language handling.
+      // The request still sends the selected page image for live OCR; the
+      // frontend does not supply a replacement transcript.
       const ocrHints = resolveOcrPromptHints(userPrompt, currentMetadata);
       const response = await extractPageText({
         document_id: currentDocumentId,
@@ -1725,6 +1732,9 @@ export function DocumentChatWorkspace({ initialDocumentId }: DocumentChatWorkspa
         } : undefined,
       });
 
+      // Keep the recognized text and trace metadata together. The run ID and
+      // reports let the UI expose the backend's persisted analysis for the same
+      // request that produced the visible transcription.
       const rawExtractedText = mergeOCRResultText(response);
       const finalText = removeTextUncertainties(rawExtractedText);
       const storedText = finalText || "";
@@ -1966,6 +1976,9 @@ export function DocumentChatWorkspace({ initialDocumentId }: DocumentChatWorkspa
               </div>
 
               <div className="mb-2 flex-1 overflow-auto rounded-md border bg-background p-2">
+                {/* The segmentation preview is a display aid. OCR requests use
+                    currentPage.dataUrl so toggling this overlay never changes
+                    the source image sent to the backend. */}
                 <Image
                   src={showSegmentationOverlay && currentSegmentedPreview ? currentSegmentedPreview : currentPage.dataUrl}
                   alt={showSegmentationOverlay && currentSegmentedPreview ? `${currentPage.name} segmented` : currentPage.name}
