@@ -1,86 +1,92 @@
-# ArchAI Workspace
+# ArchAI Layout Workspace
 
-ArchAI now uses a **Document + Chat** workflow.
+ArchAI is a local-first workspace for medieval manuscript page analysis. It pairs
+a FastAPI backend with a Next.js document workspace for segmentation, OCR,
+grounded chat, translation, and entity analysis.
 
-## What this app does
+## Capabilities
 
-- Upload document page images in the workspace
-- Navigate pages in a left document sidebar
-- Chat with a selected model in the center panel
-- Optionally attach the current page image for vision-capable models
-- Proxy all model calls through backend endpoints (`/api/chat/*`)
-
-Legacy OCR/HTR extraction flows were removed.
+- Upload and navigate multi-page manuscript images
+- Run layout segmentation and inspect the overlay
+- Extract full-page text through the configured GLM OCR runtime
+- Crop and analyze labeled manuscript regions
+- Chat over the current document, including translation and entity questions
+- Persist OCR traces, evidence spans, quality signals, and authority-linking data
 
 ## Architecture
 
-- Backend: FastAPI (`backend/app/main.py`)
-- Frontend: Next.js app router (`frontend/src/app`)
-- Chat provider: GWDG Chat AI OpenAI-compatible API (`https://chat-ai.academiccloud.de/v1`)
+- `backend/app/main.py`: ASGI entry point
+- `backend/app/core/`: application factory and model-pool lifecycle
+- `backend/app/api/`: public router registration
+- `backend/app/routers/`: HTTP endpoints
+- `backend/app/services/`: OCR, RAG, evidence, and model integrations
+- `backend/app/agents/`: OCR and analysis orchestration
+- `frontend/src/components/workspace/`: workspace UI orchestration
+- `frontend/src/features/workspace/`: workspace constants, browser file helpers,
+  command intent parsing, and segmentation utilities
+- `frontend/src/lib/`: API clients and shared workspace types
 
-## Required environment variables
+## Configuration
 
-Set these in `backend/.env.local` (or `backend/.env`) or your shell:
-
-```bash
-CHAT_AI_API_KEY=...
-CHAT_AI_BASE_URL=https://chat-ai.academiccloud.de/v1
-SAIA_API_KEY=...
-SAIA_BASE_URL=https://chat-ai.academiccloud.de/v1
-SAIA_TIMEOUT_SECONDS=120
-SAIA_MODELS_CACHE_TTL_SECONDS=300
-SAIA_OCR_MODEL_PREFS=qwen3-vl-30b-a3b-instruct,internvl3.5-30b-a3b,mistral-large-3-675b-instruct-2512,gemma-3-27b-it
-SAIA_OCR_TEMPERATURE=0
-SAIA_OCR_MAX_TOKENS=8192
-SAIA_MODEL_PROBE=0
-ARCHAI_CHAT_AI_MODEL=meta-llama-3.1-8b-instruct
-```
-
-Do not commit API keys.
-
-## Run locally
-
-### 1) Backend
+Copy the backend environment template and provide the services you intend to use:
 
 ```bash
 cd backend
-python -m uvicorn app.main:app --host 127.0.0.1 --port 8000
+cp .env.example .env
 ```
 
-### 2) Frontend
+The Chat AI and SAIA keys are optional until chat or vision analysis is used. OCR
+requires a reachable GLM/Ollama runtime by default. Never commit API keys or
+local model weights.
+
+Important variables include:
+
+```bash
+CHAT_AI_API_KEY=...
+SAIA_API_KEY=...
+GLMOCR_OLLAMA_HOST=http://localhost:11434
+GLMOCR_OLLAMA_MODEL=glm-ocr:latest
+```
+
+## Run Locally
+
+Backend:
+
+```bash
+cd backend
+python -m venv .venv
+source .venv/bin/activate
+pip install -e ".[dev]"
+uvicorn app.main:app --host 127.0.0.1 --port 8000
+```
+
+Frontend:
 
 ```bash
 cd frontend
+npm install
 npm run dev -- --hostname 127.0.0.1 --port 3001
 ```
 
-Open: `http://127.0.0.1:3001/workspace`
+Open [http://127.0.0.1:3001/workspace](http://127.0.0.1:3001/workspace).
 
-## API endpoints
+## Validation
 
-- `GET /api/chat/models`
-  - Lists available model IDs from GWDG
-- `POST /api/chat/completions`
-  - Accepts chat messages, optional context, and optional streaming
-  - Supports OpenAI-style multimodal message blocks for vision use cases
-- `POST /api/ocr/saia`
-  - Full-page SAIA OCR endpoint (server-side only, no browser key exposure)
-  - Sends the current full page image directly to SAIA vision chat models
-  - Returns `status`, `model_used`, `fallbacks`, `warnings`, `lines`, `text`, `script_hint`, `confidence`
-- `POST /api/evidence/spans`
-  - Stores OCR spans (text + coords + model/prompt/crop hash provenance)
+```bash
+cd backend
+python -m pytest -q
 
-## Workspace behavior
+cd ../frontend
+npm run lint
+npm run build
+```
 
-- Route: `/workspace` and `/workspace/[documentId]`
-- Left panel:
-  - document picker
-  - current page preview
-  - segmentation overlay toggle
-  - page navigation + thumbnails
-- Middle panel:
-  - message history
-  - model selector
-  - include-page-image toggle
-  - streaming assistant responses
-  - `Extract (SAIA OCR)` action with popup, copy, insert-into-chat
+## API Highlights
+
+- `GET /api/health`: service status
+- `GET /api/chat/models`: available chat models
+- `POST /api/chat/completions`: chat and streaming responses
+- `POST /api/predict`: page segmentation
+- `POST /api/ocr/extract_full_page`: full-page OCR with persisted analysis
+- `POST /api/ocr/page_with_trace`: segmented OCR trace pipeline
+- `GET /api/ocr/trace/{run_id}`: persisted trace snapshot

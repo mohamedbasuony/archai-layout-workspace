@@ -486,10 +486,18 @@ def _build_segmentation_for_crop(metadata: OCRRecognitionMetadata, crop_width: i
 class SAIABackend(OCRBackend):
     backend_name = "saia"
 
-    def __init__(self, *, client: Any, quality_floor: float = 0.60, max_fallbacks: int = 2) -> None:
+    def __init__(
+        self,
+        *,
+        client: Any,
+        quality_floor: float = 0.60,
+        max_fallbacks: int = 2,
+        model_preferences: Sequence[str] | None = None,
+    ) -> None:
         self.client = client
         self.quality_floor = quality_floor
         self.max_fallbacks = max_fallbacks
+        self.model_preferences = tuple(model_preferences or ())
 
     def recognize(self, crop_b64: str, metadata: OCRRecognitionMetadata) -> OCRBackendResult:
         from app.agents import ocr_agent as ocr_agent_module
@@ -501,7 +509,7 @@ class SAIABackend(OCRBackend):
             raise OCRBackendError(f"Could not decode OCR crop for SAIA backend: {exc}") from exc
         try:
             available_models = self.client.list_models()
-            preferred_models = ocr_agent_module.resolve_model_preferences()
+            preferred_models = ocr_agent_module.resolve_model_preferences(explicit=self.model_preferences)
             candidate_models = ocr_agent_module.choose_models(available_models, preferred_models)
             max_attempts = min(len(candidate_models), 1 + self.max_fallbacks)
             selected_models = candidate_models[:max_attempts]
@@ -905,6 +913,7 @@ def build_backend_runtime(
     saia_client: Any,
     quality_floor: float,
     max_fallbacks: int,
+    model_preferences: Sequence[str] | None = None,
 ) -> dict[str, OCRBackend]:
     runtime: dict[str, OCRBackend] = {}
     for backend_id in dict.fromkeys(str(item).strip().lower() for item in backend_ids if str(item).strip()):
@@ -913,6 +922,7 @@ def build_backend_runtime(
                 client=saia_client,
                 quality_floor=quality_floor,
                 max_fallbacks=max_fallbacks,
+                model_preferences=model_preferences,
             )
         elif backend_id == "kraken":
             runtime[backend_id] = KrakenCatmusBackend()

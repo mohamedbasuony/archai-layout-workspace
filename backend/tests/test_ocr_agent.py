@@ -47,11 +47,14 @@ class _FakeSaiaClient:
 
 
 def _sample_request(options: OCRExtractOptions | None = None) -> OCRExtractRequest:
+    options = options or OCRExtractOptions()
+    if options.backend == "auto":
+        options = options.model_copy(update={"backend": "saia"})
     return OCRExtractRequest(
         page_id="page-1",
         image_b64="iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADElEQVR42mNk+M/wHwAE/wJ/lxNn4QAAAABJRU5ErkJggg==",
         regions=[OCRRegionInput(region_id="r1", bbox_xyxy=[0, 0, 1, 1])],
-        options=options or OCRExtractOptions(),
+        options=options,
     )
 
 
@@ -130,7 +133,9 @@ def test_ocr_agent_returns_empty_string_for_no_readable_response(monkeypatch: An
     )
     monkeypatch.setattr(ocr_agent, "SaiaClient", lambda: fake)
 
-    result = ocr_agent.run_ocr_extraction(_sample_request(OCRExtractOptions(max_fallbacks=0, quality_floor=0.0)))
+    result = ocr_agent.run_ocr_extraction(
+        _sample_request(OCRExtractOptions(max_fallbacks=0, quality_floor=0.0, language_hint="latin"))
+    )
 
     assert result.model == "internvl3.5-30b-a3b"
     assert result.text == ""

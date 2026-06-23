@@ -262,9 +262,10 @@ def _parse_preference_env(raw: str) -> list[str]:
 
 
 def resolve_model_preferences(explicit: Sequence[str] | None = None, prefer_model: str | None = None) -> list[str]:
-    _ = explicit
-    _ = prefer_model
-    return [LOCKED_OCR_MODEL]
+    preferences = [str(item).strip() for item in (explicit or []) if str(item).strip()]
+    if prefer_model and prefer_model.strip():
+        preferences.insert(0, prefer_model.strip())
+    return list(dict.fromkeys(preferences)) or [LOCKED_OCR_MODEL]
 
 
 def is_vision_model(model_id: str) -> bool:
@@ -1112,6 +1113,10 @@ def _run_segmented_ocr_extraction(
         saia_client=client,
         quality_floor=payload.options.quality_floor,
         max_fallbacks=payload.options.max_fallbacks,
+        model_preferences=resolve_model_preferences(
+            explicit=payload.options.model_preference,
+            prefer_model=payload.prefer_model,
+        ),
     )
     plan, prefetched_regions, prefetched_results, prefetched_errors = _reorder_attempt_backends_from_samples(
         plan=plan,
@@ -1313,6 +1318,16 @@ def _run_segmented_ocr_extraction(
         warnings.extend(f"{item}:{region_id}" for item in raw_warnings)
         raw_flags = [str(item) for item in raw_meta.get("flags", [])]
         warnings.extend(f"{item}:{region_id}" for item in raw_flags)
+        nested_fallbacks = [str(item) for item in raw_meta.get("fallbacks_used", []) if str(item).strip()]
+        nested_reasons = [str(item) for item in raw_meta.get("fallback_reasons", [])]
+        for fallback_index, fallback_model in enumerate(nested_fallbacks):
+            fallbacks_used.append(fallback_model)
+            fallback_records.append(
+                OCRFallback(
+                    model=fallback_model,
+                    reason=nested_reasons[fallback_index] if fallback_index < len(nested_reasons) else "BACKEND_FALLBACK",
+                )
+            )
         region_results.append(
             OCRRegionResult(
                 region_id=region_id,

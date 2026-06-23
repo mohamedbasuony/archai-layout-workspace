@@ -53,7 +53,6 @@ ARABIC_RE = re.compile(r"[\u0600-\u06FF]")
 HEBREW_RE = re.compile(r"[\u0590-\u05FF]")
 LATIN_TOKEN_RE = re.compile(r"^[A-Za-zÀ-ÖØ-öø-ÿĀ-žſƀ-ɏ]+$")
 VISION_MODEL_HINTS = ("vl", "vision", "internvl", "gemma", "mistral", "omni")
-INTERNVL_MODEL_HINT = "internvl"
 REQUIRED_JSON_KEYS = ("lines", "text", "script_hint", "detected_language", "confidence", "warnings")
 FRENCH_STRONG_ANCHORS = {
     "tres",
@@ -180,7 +179,7 @@ SAIA_OCR_SYSTEM_PROMPT = (
 )
 SAIA_OCR_USER_PROMPT = (
     "Return JSON only.\n"
-    "Schema: keys must be exactly: lines, text, script_hint, detected_language, confidence, warnings.\n"
+    "Keys must be exactly: lines, text, script_hint, detected_language, confidence, warnings.\n"
     "- One manuscript line per entry in lines. Each entry MUST NOT contain '\\n'.\n"
     "- text must equal \"\\n\".join(lines).\n"
     "- Preserve original spelling, abbreviations, punctuation, capitalization, and line breaks.\n"
@@ -440,8 +439,12 @@ def _parse_csv_or_json_list(raw: str) -> list[str]:
     return [item.strip() for item in text.split(",") if item.strip()]
 
 
-def _filter_internvl_models(models: Sequence[str]) -> list[str]:
-    return [model for model in models if INTERNVL_MODEL_HINT in str(model).lower()]
+def _filter_vision_models(models: Sequence[str]) -> list[str]:
+    return [
+        model
+        for model in models
+        if any(hint in str(model).lower() for hint in VISION_MODEL_HINTS)
+    ]
 
 
 def _strip_fences(raw: str) -> str:
@@ -1870,15 +1873,13 @@ class SaiaOCRAgent:
         model_prefs: Sequence[str] | None = None,
     ) -> None:
         self.client = client or SaiaClient()
-        self.model_prefs = (
-            _filter_internvl_models(model_prefs) if model_prefs is not None else self._resolve_model_prefs()
-        )
+        self.model_prefs = _filter_vision_models(model_prefs) if model_prefs is not None else self._resolve_model_prefs()
         self.temperature = self._resolve_temperature()
         self.max_tokens = self._resolve_max_tokens()
 
     @staticmethod
     def _resolve_model_prefs() -> list[str]:
-        prefs = _filter_internvl_models(
+        prefs = _filter_vision_models(
             _parse_csv_or_json_list(
             settings.saia_ocr_models
             or os.getenv("SAIA_OCR_MODELS", "")
@@ -1888,7 +1889,7 @@ class SaiaOCRAgent:
             or DEFAULT_MODEL_PREFS_CSV
             )
         )
-        return prefs or _filter_internvl_models(DEFAULT_SAIA_OCR_MODEL_PREFS)
+        return prefs or _filter_vision_models(DEFAULT_SAIA_OCR_MODEL_PREFS)
 
     @staticmethod
     def _resolve_temperature() -> float:
@@ -1936,7 +1937,7 @@ class SaiaOCRAgent:
             key = model.lower()
             if key in seen:
                 continue
-            if INTERNVL_MODEL_HINT in key:
+            if any(hint in key for hint in VISION_MODEL_HINTS):
                 seen.add(key)
                 ordered.append(model)
 
@@ -1990,6 +1991,7 @@ class SaiaOCRAgent:
                 temperature=self.temperature,
                 top_p=1.0,
                 max_tokens=self.max_tokens,
+                deterministic=True,
                 response_format={"type": "json_object"},
                 messages=messages,
             )
@@ -2002,6 +2004,7 @@ class SaiaOCRAgent:
                 temperature=self.temperature,
                 top_p=1.0,
                 max_tokens=self.max_tokens,
+                deterministic=True,
                 messages=messages,
             )
 
@@ -2513,7 +2516,7 @@ class SaiaOCRAgent:
         available_models = self.client.list_models()
         candidate_models = self._select_candidate_models(available_models)
         if not candidate_models:
-            raise SaiaOCRAgentError("No InternVL model is available on SAIA /models.")
+            raise SaiaOCRAgentError("No configured vision model is available on SAIA /models.")
 
         # --- Tile-based OCR when location_suggestions are present ---
         if payload.location_suggestions and len(payload.location_suggestions) >= 1:
